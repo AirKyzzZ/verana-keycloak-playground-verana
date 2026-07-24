@@ -7,7 +7,7 @@
 - Browser boundary snapshot: `a736ef5`; the later security fixes were verified
   by focused and full automated checks, not promoted to new browser evidence.
 - Runtime: Node.js 24.14.0 and pnpm 10.28.1.
-- VS Agent subject/trust integration tested: `ec078f1` (includes the
+- VS Agent subject/trust integration tested: `e2bba78` (includes the
   subject-capability work at `d778012`).
 - Network: Verana testnet resolver at
   `https://resolver.testnet.verana.network/v1/trust`.
@@ -31,7 +31,7 @@ acceptance. No fixture result is promoted to live evidence.
 | `docker compose ps` | 0 | `auth-demo-keycloak-1` reported healthy. |
 | `docker compose config` | 0 | Rendered one loopback-bound Keycloak 26.7.0 service with the generated realm mounted read-only. |
 | `pnpm check` | 0 | Biome checked 50 files; both workspaces typechecked and built; 172 tests passed in 16 files. |
-| VS Agent OpenID4VC plugin test and build | 0 | 72 tests passed in 10 files, including exact Q1 DID/production and Q2/Q3 DID/VTJSC response binding for issuer and verifier; the package rebuilt successfully. |
+| VS Agent OpenID4VC plugin test and build | 0 | 80 tests passed in 10 files, including exact Q1 DID/production and Q2/Q3 DID/VTJSC response binding plus bounded resolver responses for issuer and verifier; the package rebuilt successfully. |
 | `pnpm exec tsc --noEmit --target ES2024 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck scripts/verify-local-flow.ts tests/local-flow-verification.test.ts` | 0 | Standalone script and focused test TypeScript check passed. |
 | `pnpm tsx scripts/verify-keycloak.ts` | 0 | Realm, Authorization Code with S256, IdP, broker signature/secret behavior, JIT-only first login, exact mappers, authorization targets, and zero pre-created users passed. |
 | `pnpm tsx scripts/verify-local-flow.ts` | 1 | On the fresh repeat, live resolver checks passed, then acceptance stopped with `FAIL BLOCKED_SUBJECT_CONTRACT` before credential issuance. |
