@@ -1,8 +1,10 @@
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -23,7 +25,7 @@ import {
 const roots: string[] = [];
 
 interface FakeBehavior {
-  freeBytes?: number;
+  driverStatus?: string;
   nodeMajor?: number;
   portOwners?: Partial<Record<number, string>>;
   twitterRunning?: boolean;
@@ -32,22 +34,31 @@ interface FakeBehavior {
   keycloakUsers?: number;
   hostToken?: string;
   failCommand?: readonly string[];
+  failComposeDown?: boolean;
+  failTwitterStart?: boolean;
+  composeResources?: string;
+  composeVolumes?: string;
 }
 
 class FakeRunner implements CommandRunner {
   readonly calls: [string, readonly string[]][] = [];
+  readonly sequence: string[] = [];
+  onRun?: (command: string, args: readonly string[]) => void;
+  readonly options: {
+    command: string;
+    args: readonly string[];
+    options?: { cwd?: string; env?: NodeJS.ProcessEnv };
+  }[] = [];
   private readonly behavior: Required<
-    Pick<
-      FakeBehavior,
-      "freeBytes" | "nodeMajor" | "twitterRunning" | "vsCommit"
-    >
+    Pick<FakeBehavior, "nodeMajor" | "twitterRunning" | "vsCommit">
   > &
     FakeBehavior;
   private stackRunning = false;
 
   constructor(behavior: FakeBehavior = {}) {
     this.behavior = {
-      freeBytes: 30_000_000_000,
+      driverStatus:
+        '[["Backing Filesystem","ext4"],["Data Space Available","30GB"]]\n',
       nodeMajor: 24,
       twitterRunning: false,
       vsCommit: "e2bba78746cb2c7ca7f43d28dc9641316f524d24",
@@ -57,8 +68,22 @@ class FakeRunner implements CommandRunner {
     };
   }
 
-  async run(command: string, args: readonly string[]): Promise<CommandResult> {
+  async run(
+    command: string,
+    args: readonly string[],
+    options?: { cwd?: string; env?: NodeJS.ProcessEnv },
+  ): Promise<CommandResult> {
     this.calls.push([command, args]);
+    this.sequence.push(`${command}:${args.join(":")}`);
+    this.onRun?.(command, args);
+    this.options.push({ command, args, ...(options ? { options } : {}) });
+    if (
+      command === "docker" &&
+      args.includes("down") &&
+      this.behavior.failComposeDown
+    ) {
+      return { exitCode: 1, stdout: "", stderr: "compose down failed" };
+    }
     if (
       this.behavior.failCommand?.every((value, index) => args[index] === value)
     ) {
@@ -68,6 +93,9 @@ class FakeRunner implements CommandRunner {
       this.behavior.twitterRunning = false;
     }
     if (command === "docker" && args[0] === "start") {
+      if (this.behavior.failTwitterStart) {
+        return { exitCode: 1, stdout: "", stderr: "Twitter restart failed" };
+      }
       this.behavior.twitterRunning = true;
     }
     if (command === "docker" && args.includes("up")) this.stackRunning = true;
@@ -91,10 +119,24 @@ class FakeRunner implements CommandRunner {
         stderr: "",
       };
     }
-    if (command === "docker" && args[0] === "system") {
+    if (command === "docker" && args[0] === "info") {
       return {
         exitCode: 0,
-        stdout: JSON.stringify({ freeBytes: this.behavior.freeBytes }),
+        stdout: this.behavior.driverStatus ?? "[]\n",
+        stderr: "",
+      };
+    }
+    if (command === "docker" && args[0] === "volume") {
+      return {
+        exitCode: 0,
+        stdout: this.behavior.composeVolumes ?? "",
+        stderr: "",
+      };
+    }
+    if (command === "docker" && args[0] === "compose" && args.includes("ps")) {
+      return {
+        exitCode: 0,
+        stdout: this.behavior.composeResources ?? "[]\n",
         stderr: "",
       };
     }
@@ -261,7 +303,10 @@ describe("guarded local controlled stack lifecycle", () => {
     ["wrong VS repository", { vsRemote: "https://github.com/other/vs-agent" }],
     ["wrong VS commit", { vsCommit: "deadbeef" }],
     ["Node 23", { nodeMajor: 23 }],
-    ["insufficient disk", { freeBytes: 1 }],
+    [
+      "insufficient disk",
+      { driverStatus: '[["Data Space Available","1B"]]\n' },
+    ],
   ])("fails preflight before Compose for %s", async (_name, behavior) => {
     const root = await makeRoot();
     const runner = new FakeRunner(behavior);
@@ -349,7 +394,7 @@ describe("guarded local controlled stack lifecycle", () => {
     const outside = await mkdtemp(join(tmpdir(), "outside-local-controlled-"));
     roots.push(outside);
     await symlink(outside, join(root, ".data"));
-    const runner = new FakeRunner();
+    const runner = new FakeRunner({ driverStatus: "[]\n" });
 
     await expect(preflight(dependencies(runner, root))).rejects.toThrow(
       "symlink",
@@ -367,6 +412,230 @@ describe("guarded local controlled stack lifecycle", () => {
 
     await expect(down(deps)).rejects.toThrow("outside the repository");
     expect(runner.calls).toHaveLength(0);
+  });
+
+  it("preserves unrelated regular data and directories during teardown", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    const unrelatedFile = join(root, ".data", "notes.txt");
+    const unrelatedDirectory = join(root, ".data", "manual-artifacts");
+
+    await up(deps);
+    await writeFile(unrelatedFile, "keep me");
+    await mkdir(unrelatedDirectory);
+    await writeFile(join(unrelatedDirectory, "record.txt"), "keep me too");
+    runner.setHostToken("verified-start-token");
+    await down(deps);
+
+    await expect(readFile(unrelatedFile, "utf8")).resolves.toBe("keep me");
+    await expect(
+      readFile(join(unrelatedDirectory, "record.txt"), "utf8"),
+    ).resolves.toBe("keep me too");
+  });
+
+  it("restores Twitter when partial startup data generation fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({ twitterRunning: true });
+    const deps = dependencies(runner, root);
+    deps.generateData = async () => {
+      throw new Error("generated data failed");
+    };
+
+    await expect(up(deps)).rejects.toThrow("generated data failed");
+
+    expect(runner.calls).toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
+    ]);
+  });
+
+  it("restores Twitter even when Compose teardown fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      twitterRunning: true,
+      failComposeDown: true,
+    });
+    const deps = dependencies(runner, root, { launchFails: true });
+
+    await expect(up(deps)).rejects.toThrow("host start failed");
+
+    expect(runner.calls).toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
+    ]);
+    await expect(
+      readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+    ).resolves.toContain("twitterWasRunning");
+  });
+
+  it("restores Twitter and preserves recovery state when owned data cleanup fails", async () => {
+    const root = await makeRoot();
+    const outside = await mkdtemp(join(tmpdir(), "outside-local-controlled-"));
+    roots.push(outside);
+    const runner = new FakeRunner({ twitterRunning: true });
+    const deps = dependencies(runner, root);
+
+    await up(deps);
+    await rm(join(root, ".data", ".env"));
+    await symlink(outside, join(root, ".data", ".env"));
+    runner.setHostToken("verified-start-token");
+
+    await expect(down(deps)).rejects.toThrow();
+    expect(runner.calls).toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
+    ]);
+    await expect(
+      readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+    ).resolves.toContain("twitterWasRunning");
+  });
+
+  it("preserves recovery state when Twitter restoration fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      twitterRunning: true,
+      failTwitterStart: true,
+    });
+    const deps = dependencies(runner, root);
+
+    await up(deps);
+    runner.setHostToken("verified-start-token");
+
+    await expect(down(deps)).rejects.toThrow("docker start");
+    await expect(
+      readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+    ).resolves.toContain("twitterWasRunning");
+  });
+
+  it("runs every Compose operation from the validated repository root", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+
+    await up(deps);
+    runner.setHostToken("verified-start-token");
+    await down(deps);
+
+    expect(
+      runner.options
+        .filter(
+          ({ command, args }) => command === "docker" && args[0] === "compose",
+        )
+        .every(({ options }) => options?.cwd === root),
+    ).toBe(true);
+  });
+
+  it("rejects generated environment attempts to override host invariants", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    deps.generateData = async (output) => {
+      await writeFile(
+        join(output, ".env"),
+        "PATH=/attacker\nNODE_OPTIONS=--inspect\n",
+      );
+      await writeFile(
+        join(output, "local-controlled.env"),
+        "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
+      );
+    };
+
+    await expect(up(deps)).rejects.toThrow("host environment override");
+  });
+
+  it("rejects stopped exact-project Compose resources before build", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      composeResources:
+        '[{"Name":"verana-keycloak-local-controlled-keycloak-1","State":"exited"}]\n',
+    });
+
+    await expect(up(dependencies(runner, root))).rejects.toThrow(
+      "partial state",
+    );
+    expect(runner.composeUpCalls()).toHaveLength(0);
+  });
+
+  it("rejects exact-project leftover volumes before build", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      composeVolumes: "verana-keycloak-local-controlled_issuer-afj\n",
+    });
+
+    await expect(up(dependencies(runner, root))).rejects.toThrow(
+      "leftover volume",
+    );
+    expect(runner.composeUpCalls()).toHaveLength(0);
+  });
+
+  it("fails closed when Docker runtime capacity cannot be determined", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({ driverStatus: "[]\n" });
+
+    await expect(up(dependencies(runner, root))).rejects.toThrow(
+      "capacity cannot be determined",
+    );
+    expect(runner.composeUpCalls()).toHaveLength(0);
+  });
+
+  it("chmods an existing lifecycle state file to 0600", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const statePath = join(root, ".data", "local-stack-state.json");
+    await writeFile(statePath, "{}\n");
+    await chmod(statePath, 0o644);
+
+    await up(dependencies(runner, root));
+
+    expect((await stat(statePath)).mode & 0o777).toBe(0o600);
+  });
+
+  it("waits for a verified host process to exit before Compose teardown", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const order: string[] = [];
+    const deps = dependencies(runner, root, { signals: [] });
+    runner.onRun = (command, args) => {
+      if (command === "docker" && args.includes("down")) {
+        order.push("compose-down");
+      }
+    };
+    let checks = 0;
+    deps.isProcessRunning = async () => {
+      checks += 1;
+      order.push(`check-${checks}`);
+      return checks === 1;
+    };
+    deps.sleep = async () => {
+      order.push("sleep");
+    };
+
+    await up(deps);
+    runner.setHostToken("verified-start-token");
+    await down(deps);
+
+    expect(order).toEqual(["check-1", "sleep", "check-2", "compose-down"]);
+  });
+
+  it("times out host shutdown without deleting state and still restores Twitter", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({ twitterRunning: true });
+    const deps = dependencies(runner, root);
+    deps.isProcessRunning = async () => true;
+    deps.sleep = async () => undefined;
+
+    await up(deps);
+    runner.setHostToken("verified-start-token");
+
+    await expect(down(deps)).rejects.toThrow("host process did not exit");
+    expect(runner.calls).toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
+    ]);
+    await expect(
+      readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+    ).resolves.toContain("twitterWasRunning");
   });
 
   it("reports stale host metadata without killing an unrelated process", async () => {

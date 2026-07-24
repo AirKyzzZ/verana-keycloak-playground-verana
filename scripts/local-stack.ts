@@ -1,16 +1,16 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  chmod,
   lstat,
   mkdir,
   open,
-  readdir,
   readFile,
+  realpath,
   rm,
-  statfs,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { LOCAL_CONTROLLED } from "./local-controlled-config.js";
@@ -19,6 +19,13 @@ import { generateLocalControlledData } from "./setup-local-controlled.js";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataDirectoryName = ".data";
 const stateFileName = "local-stack-state.json";
+const lifecycleDirectoryName = "local-stack";
+const generatedDataFiles = [
+  ".env",
+  "local-controlled.env",
+  "broker-jwks.json",
+  "realm.json",
+] as const;
 const minimumFreeBytes = 8 * 1024 * 1024 * 1024;
 const requiredPorts = [...LOCAL_CONTROLLED.ports];
 const expectedVsAgentRepository = "https://github.com/verana-labs/vs-agent";
@@ -47,6 +54,7 @@ interface LocalStackState {
   composeProject: typeof LOCAL_CONTROLLED.composeProject;
   twitterWasRunning: boolean;
   hostProcess?: HostProcess;
+  ownedDataFiles: readonly (typeof generatedDataFiles)[number][];
   vsSourceCommit: string;
   startedAt: string;
 }
@@ -75,6 +83,8 @@ export interface LifecycleDependencies {
     startToken: string;
   }) => Promise<HostProcess>;
   signalProcessGroup?: (pid: number) => void;
+  isProcessRunning?: (pid: number) => Promise<boolean>;
+  sleep?: (milliseconds: number) => Promise<void>;
   fetch?: typeof fetch;
   randomToken?: () => string;
   now?: () => Date;
@@ -93,13 +103,6 @@ const composeBaseArgs = [
   "compose.local-controlled.yaml",
 ] as const;
 
-const composeDownArgs = [
-  ...composeBaseArgs,
-  "down",
-  "--volumes",
-  "--remove-orphans",
-] as const;
-
 export async function preflight(
   dependencies: LifecycleDependencies = {},
 ): Promise<PreflightResult> {
@@ -108,7 +111,9 @@ export async function preflight(
   assertNodeVersion(context.nodeVersion);
 
   await requireSuccess(context.runner, "docker", ["version"]);
-  await requireSuccess(context.runner, "docker", ["compose", "version"]);
+  await requireSuccess(context.runner, "docker", ["compose", "version"], {
+    cwd: context.root,
+  });
   await assertGitWorktree(context.runner, context.root, "playground worktree");
   await assertGitWorktree(
     context.runner,
@@ -131,7 +136,7 @@ export async function preflight(
   await assertCapacity(context);
   const twitterWasRunning = await readTwitterState(context.runner);
   await assertPortsAvailable(context.runner, false);
-  await assertNoAmbiguousComposeState(context.runner);
+  await assertNoAmbiguousComposeState(context);
 
   return { twitterWasRunning, vsSourceCommit };
 }
@@ -147,12 +152,14 @@ export async function up(
     twitterWasRunning: checked.twitterWasRunning,
     vsSourceCommit: checked.vsSourceCommit,
     startedAt: context.now().toISOString(),
+    ownedDataFiles: generatedDataFiles,
   };
   let stateWritten = false;
 
   try {
     await writeState(context, initialState);
     stateWritten = true;
+    await assertGeneratedDataTargetsAvailable(context);
     await context.generateData(context.dataDirectory, context.vsSourcePath);
 
     if (checked.twitterWasRunning) {
@@ -162,13 +169,8 @@ export async function up(
       ]);
     }
 
-    await requireSuccess(context.runner, "docker", [
-      ...composeBaseArgs,
-      "build",
-      "issuer",
-    ]);
-    await requireSuccess(context.runner, "docker", [
-      ...composeBaseArgs,
+    await runCompose(context, ["build", "issuer"]);
+    await runCompose(context, [
       "up",
       "-d",
       "--force-recreate",
@@ -230,26 +232,18 @@ export async function down(
     return;
   }
 
-  await stopVerifiedHostProcess(context, currentState);
-  await requireSuccess(context.runner, "docker", composeDownArgs);
-  await removeVerifiedData(context);
-
-  if (currentState.twitterWasRunning) {
-    await requireSuccess(context.runner, "docker", [
-      "start",
-      LOCAL_CONTROLLED.twitterContainer,
-    ]);
+  const errors = await teardown(context, currentState);
+  if (errors.length > 0) {
+    throw new Error(errors.map((error) => error.message).join("; "));
   }
-
-  if (await portsAreClear(context.runner, currentState.twitterWasRunning)) {
-    context.write(
-      currentState.twitterWasRunning
-        ? "LOCAL_CONTROLLED ports released to Twitter"
-        : "LOCAL_CONTROLLED ports clear",
-    );
-  } else {
+  if (!(await portsAreClear(context.runner, currentState.twitterWasRunning))) {
     throw new Error("LOCAL_CONTROLLED required ports remain occupied");
   }
+  context.write(
+    currentState.twitterWasRunning
+      ? "LOCAL_CONTROLLED ports released to Twitter"
+      : "LOCAL_CONTROLLED ports clear",
+  );
 }
 
 function createContext(dependencies: LifecycleDependencies) {
@@ -264,6 +258,7 @@ function createContext(dependencies: LifecycleDependencies) {
   return {
     root: projectRoot,
     dataDirectory,
+    lifecycleDirectory: join(dataDirectory, lifecycleDirectoryName),
     vsSourcePath,
     nodeVersion: dependencies.nodeVersion ?? process.version,
     runner: dependencies.runner ?? systemRunner,
@@ -271,6 +266,8 @@ function createContext(dependencies: LifecycleDependencies) {
     launch: dependencies.launch ?? launchHostProcess,
     signalProcessGroup:
       dependencies.signalProcessGroup ?? defaultSignalProcessGroup,
+    isProcessRunning: dependencies.isProcessRunning ?? defaultIsProcessRunning,
+    sleep: dependencies.sleep ?? defaultSleep,
     fetch: dependencies.fetch ?? fetch,
     randomToken:
       dependencies.randomToken ?? (() => randomBytes(32).toString("hex")),
@@ -297,6 +294,36 @@ async function assertSafePaths(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+}
+
+async function assertDestructivePaths(
+  context: ReturnType<typeof createContext>,
+): Promise<void> {
+  await assertSafePaths(context.root, context.dataDirectory);
+  const [realRoot, realData] = await Promise.all([
+    realpath(context.root),
+    realpath(context.dataDirectory),
+  ]);
+  if (realData !== join(realRoot, dataDirectoryName)) {
+    throw new Error(
+      "LOCAL_CONTROLLED data path changed outside the repository",
+    );
+  }
+}
+
+function statePath(context: ReturnType<typeof createContext>): string {
+  return join(context.dataDirectory, stateFileName);
+}
+
+function ownedDataPath(
+  context: ReturnType<typeof createContext>,
+  file: (typeof generatedDataFiles)[number],
+): string {
+  const path = join(context.dataDirectory, file);
+  if (dirname(path) !== context.dataDirectory) {
+    throw new Error("LOCAL_CONTROLLED invalid owned data path");
+  }
+  return path;
 }
 
 function assertNodeVersion(nodeVersion: string): void {
@@ -366,41 +393,47 @@ async function assertVsAgentRepository(
 async function assertCapacity(
   context: ReturnType<typeof createContext>,
 ): Promise<void> {
-  const dockerUsage = await requireSuccess(context.runner, "docker", [
-    "system",
-    "df",
-    "--format",
-    "{{json .}}",
-  ]);
-  const availableBytes =
-    capacityFromDocker(dockerUsage.stdout) ??
-    (await availableFilesystemBytes(context.root));
+  const driverStatus = await requireSuccess(
+    context.runner,
+    "docker",
+    ["info", "--format", "{{json .DriverStatus}}"],
+    { cwd: context.root },
+  );
+  const availableBytes = capacityFromDockerDriverStatus(driverStatus.stdout);
+  if (availableBytes === undefined) {
+    throw new Error(
+      "LOCAL_CONTROLLED Docker runtime capacity cannot be determined",
+    );
+  }
   if (availableBytes < minimumFreeBytes) {
     throw new Error("LOCAL_CONTROLLED has insufficient free disk capacity");
   }
 }
 
-function capacityFromDocker(output: string): number | undefined {
-  for (const line of output.split("\n")) {
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        typeof (parsed as { freeBytes?: unknown }).freeBytes === "number"
-      ) {
-        return (parsed as { freeBytes: number }).freeBytes;
-      }
-    } catch {
-      // Docker's normal human-size records do not provide an exact capacity.
-    }
+function capacityFromDockerDriverStatus(output: string): number | undefined {
+  let status: unknown;
+  try {
+    status = JSON.parse(output);
+  } catch {
+    return undefined;
   }
-  return undefined;
+  if (!Array.isArray(status)) return undefined;
+  const available = status.find(
+    (entry): entry is [string, string] =>
+      Array.isArray(entry) &&
+      entry[0] === "Data Space Available" &&
+      typeof entry[1] === "string",
+  );
+  return available ? parseDockerSize(available[1]) : undefined;
 }
 
-async function availableFilesystemBytes(path: string): Promise<number> {
-  const filesystem = await statfs(path);
-  return Number(filesystem.bavail) * Number(filesystem.bsize);
+function parseDockerSize(value: string): number | undefined {
+  const match = /^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)$/i.exec(value.trim());
+  if (!match) return undefined;
+  const multiplier = { B: 1, KB: 1e3, MB: 1e6, GB: 1e9, TB: 1e12 }[
+    match[2]?.toUpperCase() as "B" | "KB" | "MB" | "GB" | "TB"
+  ];
+  return multiplier ? Number(match[1]) * multiplier : undefined;
 }
 
 async function readTwitterState(runner: CommandRunner): Promise<boolean> {
@@ -473,19 +506,30 @@ async function dockerPortOwner(
 }
 
 async function assertNoAmbiguousComposeState(
-  runner: CommandRunner,
+  context: ReturnType<typeof createContext>,
 ): Promise<void> {
-  const result = await requireSuccess(runner, "docker", [
-    ...composeBaseArgs,
-    "ps",
-    "--format",
-    "json",
-  ]);
+  const result = await runCompose(context, ["ps", "--all", "--format", "json"]);
   const output = result.stdout.trim();
   if (output && output !== "[]") {
     throw new Error(
       "LOCAL_CONTROLLED Compose project is already in a partial state",
     );
+  }
+  const volumes = await requireSuccess(
+    context.runner,
+    "docker",
+    [
+      "volume",
+      "ls",
+      "--filter",
+      `label=com.docker.compose.project=${LOCAL_CONTROLLED.composeProject}`,
+      "--format",
+      "{{.Name}}",
+    ],
+    { cwd: context.root },
+  );
+  if (volumes.stdout.trim()) {
+    throw new Error("LOCAL_CONTROLLED Compose project has a leftover volume");
   }
 }
 
@@ -590,24 +634,20 @@ async function writeState(
   context: ReturnType<typeof createContext>,
   state: LocalStackState,
 ): Promise<void> {
-  await assertSafePaths(context.root, context.dataDirectory);
   await mkdir(context.dataDirectory, { recursive: true, mode: 0o700 });
-  await writeFile(
-    join(context.dataDirectory, stateFileName),
-    `${JSON.stringify(state)}\n`,
-    {
-      mode: 0o600,
-    },
-  );
+  await assertDestructivePaths(context);
+  const path = statePath(context);
+  await writeFile(path, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  await chmod(path, 0o600);
 }
 
 async function readState(
   context: ReturnType<typeof createContext>,
 ): Promise<LocalStackState | undefined> {
-  await assertSafePaths(context.root, context.dataDirectory);
+  await assertDestructivePaths(context);
   try {
     const parsed: unknown = JSON.parse(
-      await readFile(join(context.dataDirectory, stateFileName), "utf8"),
+      await readFile(statePath(context), "utf8"),
     );
     if (!isState(parsed))
       throw new Error("LOCAL_CONTROLLED stack state is invalid");
@@ -626,7 +666,15 @@ function isState(value: unknown): value is LocalStackState {
     state.composeProject !== LOCAL_CONTROLLED.composeProject ||
     typeof state.twitterWasRunning !== "boolean" ||
     typeof state.vsSourceCommit !== "string" ||
-    typeof state.startedAt !== "string"
+    typeof state.startedAt !== "string" ||
+    !Array.isArray(state.ownedDataFiles) ||
+    state.ownedDataFiles.some(
+      (file) =>
+        typeof file !== "string" ||
+        !generatedDataFiles.includes(
+          file as (typeof generatedDataFiles)[number],
+        ),
+    )
   ) {
     return false;
   }
@@ -643,8 +691,8 @@ function isState(value: unknown): value is LocalStackState {
 async function stopVerifiedHostProcess(
   context: ReturnType<typeof createContext>,
   state: LocalStackState,
-): Promise<void> {
-  if (!state.hostProcess) return;
+): Promise<boolean> {
+  if (!state.hostProcess) return false;
   const processState = await context.runner.run("ps", [
     "eww",
     "-p",
@@ -659,73 +707,140 @@ async function stopVerifiedHostProcess(
     context.write(
       "LOCAL_CONTROLLED stale host process metadata; not killing PID",
     );
-    return;
+    return false;
   }
   context.signalProcessGroup(state.hostProcess.pid);
+  return true;
 }
 
 async function cleanupAfterFailedStartup(
   context: ReturnType<typeof createContext>,
 ): Promise<void> {
-  try {
-    await down({
-      root: context.root,
-      vsSourcePath: context.vsSourcePath,
-      nodeVersion: context.nodeVersion,
-      runner: context.runner,
-      generateData: context.generateData,
-      launch: context.launch,
-      signalProcessGroup: context.signalProcessGroup,
-      fetch: context.fetch,
-      randomToken: context.randomToken,
-      now: context.now,
-      write: context.write,
-    });
-  } catch (cleanupError) {
+  const state = await readState(context);
+  if (!state) return;
+  const errors = await teardown(context, state);
+  if (errors.length > 0) {
     context.write(
-      `LOCAL_CONTROLLED cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : "unknown error"}`,
+      `LOCAL_CONTROLLED cleanup failed: ${errors.map((error) => error.message).join("; ")}`,
     );
   }
 }
 
-async function removeVerifiedData(
+async function teardown(
+  context: ReturnType<typeof createContext>,
+  state: LocalStackState,
+): Promise<Error[]> {
+  const errors: Error[] = [];
+  let hostExited = true;
+  try {
+    if (await stopVerifiedHostProcess(context, state)) {
+      await waitForHostProcessExit(context, state.hostProcess?.pid ?? 0);
+    }
+  } catch (error) {
+    hostExited = false;
+    errors.push(asError(error));
+  }
+
+  if (hostExited) {
+    try {
+      await runCompose(context, ["down", "--volumes", "--remove-orphans"]);
+    } catch (error) {
+      errors.push(asError(error));
+    }
+  }
+
+  try {
+    if (state.twitterWasRunning) {
+      await requireSuccess(
+        context.runner,
+        "docker",
+        ["start", LOCAL_CONTROLLED.twitterContainer],
+        { cwd: context.root },
+      );
+    }
+  } catch (error) {
+    errors.push(asError(error));
+  }
+
+  if (errors.length === 0) {
+    try {
+      await removeOwnedData(context, state);
+      await removeState(context);
+    } catch (error) {
+      errors.push(asError(error));
+    }
+  }
+  return errors;
+}
+
+async function waitForHostProcessExit(
+  context: ReturnType<typeof createContext>,
+  pid: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (!(await context.isProcessRunning(pid))) return;
+    await context.sleep(250);
+  }
+  throw new Error("LOCAL_CONTROLLED host process did not exit before teardown");
+}
+
+async function assertGeneratedDataTargetsAvailable(
   context: ReturnType<typeof createContext>,
 ): Promise<void> {
-  await assertSafePaths(context.root, context.dataDirectory);
-  const resolvedDataDirectory = resolve(context.dataDirectory);
-  if (relative(context.root, resolvedDataDirectory) !== dataDirectoryName) {
-    throw new Error(
-      "LOCAL_CONTROLLED refusing to delete data outside the repository",
-    );
+  await assertDestructivePaths(context);
+  for (const file of generatedDataFiles) {
+    try {
+      await lstat(ownedDataPath(context, file));
+      throw new Error(`LOCAL_CONTROLLED refuses to replace existing ${file}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
-  let children: string[];
+}
+
+async function removeOwnedData(
+  context: ReturnType<typeof createContext>,
+  state: LocalStackState,
+): Promise<void> {
+  await assertDestructivePaths(context);
+  for (const file of state.ownedDataFiles) {
+    const path = ownedDataPath(context, file);
+    try {
+      const details = await lstat(path);
+      if (!details.isFile() || details.isSymbolicLink()) {
+        throw new Error(
+          `LOCAL_CONTROLLED refuses to delete non-regular ${file}`,
+        );
+      }
+      await rm(path, { force: false });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+  }
   try {
-    children = await readdir(resolvedDataDirectory);
+    const details = await lstat(context.lifecycleDirectory);
+    if (!details.isDirectory() || details.isSymbolicLink()) {
+      throw new Error(
+        "LOCAL_CONTROLLED refuses to delete invalid lifecycle directory",
+      );
+    }
+    await rm(context.lifecycleDirectory, { recursive: true, force: false });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  await Promise.all(
-    children.map(async (child) => {
-      const candidate = resolve(resolvedDataDirectory, child);
-      if (dirname(candidate) !== resolvedDataDirectory) {
-        throw new Error(
-          "LOCAL_CONTROLLED refusing to delete an invalid data child",
-        );
-      }
-      if ((await lstat(candidate)).isSymbolicLink()) {
-        throw new Error(
-          "LOCAL_CONTROLLED refusing to delete a symlinked data child",
-        );
-      }
-    }),
-  );
-  await Promise.all(
-    children.map(async (child) => {
-      const candidate = resolve(resolvedDataDirectory, child);
-      await rm(candidate, { recursive: true, force: false });
-    }),
-  );
+}
+
+async function removeState(
+  context: ReturnType<typeof createContext>,
+): Promise<void> {
+  await assertDestructivePaths(context);
+  const path = statePath(context);
+  const details = await lstat(path);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw new Error("LOCAL_CONTROLLED refuses to delete invalid state file");
+  }
+  await rm(path, { force: false });
 }
 
 async function loadSanitizedEnvironment(
@@ -736,12 +851,27 @@ async function loadSanitizedEnvironment(
     readFile(join(dataDirectory, ".env"), "utf8"),
     readFile(join(dataDirectory, "local-controlled.env"), "utf8"),
   ]);
+  const parsed = {
+    ...parseEnvironment(baseEnvironment),
+    ...parseEnvironment(controlledEnvironment),
+  };
+  for (const forbidden of [
+    "PATH",
+    "NODE_ENV",
+    "NODE_OPTIONS",
+    "LOCAL_STACK_START_TOKEN",
+  ]) {
+    if (parsed[forbidden] !== undefined) {
+      throw new Error(
+        `LOCAL_CONTROLLED host environment override is forbidden: ${forbidden}`,
+      );
+    }
+  }
   return {
+    ...parsed,
     PATH: process.env.PATH,
     NODE_ENV: "production",
     LOCAL_STACK_START_TOKEN: startToken,
-    ...parseEnvironment(baseEnvironment),
-    ...parseEnvironment(controlledEnvironment),
   };
 }
 
@@ -768,7 +898,12 @@ async function launchHostProcess({
   environment: NodeJS.ProcessEnv;
   startToken: string;
 }): Promise<HostProcess> {
-  const logsDirectory = join(projectRoot, dataDirectoryName, "logs");
+  const logsDirectory = join(
+    projectRoot,
+    dataDirectoryName,
+    lifecycleDirectoryName,
+    "logs",
+  );
   await mkdir(logsDirectory, { recursive: true, mode: 0o700 });
   const log = await open(join(logsDirectory, "host-process.log"), "a", 0o600);
   const { spawn } = await import("node:child_process");
@@ -791,6 +926,25 @@ async function launchHostProcess({
 
 function defaultSignalProcessGroup(pid: number): void {
   process.kill(-pid, "SIGTERM");
+}
+
+async function defaultIsProcessRunning(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function defaultSleep(milliseconds: number): Promise<void> {
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error
+    ? error
+    : new Error("LOCAL_CONTROLLED cleanup failed");
 }
 
 const systemRunner: CommandRunner = {
@@ -820,14 +974,27 @@ async function requireSuccess(
   runner: CommandRunner,
   command: string,
   args: readonly string[],
+  options?: { cwd?: string; env?: NodeJS.ProcessEnv },
 ): Promise<CommandResult> {
-  const result = await runner.run(command, args);
+  const result = await runner.run(command, args, options);
   if (result.exitCode !== 0) {
     throw new Error(
       `LOCAL_CONTROLLED command failed: ${command} ${args.join(" ")}`,
     );
   }
   return result;
+}
+
+async function runCompose(
+  context: ReturnType<typeof createContext>,
+  args: readonly string[],
+): Promise<CommandResult> {
+  return await requireSuccess(
+    context.runner,
+    "docker",
+    [...composeBaseArgs, ...args],
+    { cwd: context.root },
+  );
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
