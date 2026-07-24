@@ -1,7 +1,12 @@
+import { isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
 
 loadDotenv({ path: ".data/.env", override: false, quiet: true });
+
+const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
 
 export const brokerConfigSchema = z.object({
   BROKER_ISSUER: z.string().url().default("http://localhost:3001"),
@@ -28,5 +33,11 @@ export type BrokerConfig = z.infer<typeof brokerConfigSchema>;
 export function loadBrokerConfig(
   environment: Record<string, string | undefined> = process.env,
 ): BrokerConfig {
-  return brokerConfigSchema.parse(environment);
+  const config = brokerConfigSchema.parse(environment);
+  return {
+    ...config,
+    BROKER_JWKS_PATH: isAbsolute(config.BROKER_JWKS_PATH)
+      ? config.BROKER_JWKS_PATH
+      : resolve(repositoryRoot, config.BROKER_JWKS_PATH),
+  };
 }
