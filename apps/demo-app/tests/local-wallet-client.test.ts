@@ -103,7 +103,6 @@ function positiveResolution(): ResolvedPresentation {
 }
 
 afterEach(async () => {
-  vi.restoreAllMocks();
   await Promise.all(
     servers.splice(0).map(
       (server) =>
@@ -312,16 +311,20 @@ describe("LocalWalletClient", () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockImplementation((input, init) => nativeFetch(input, init));
-    const client = new LocalWalletClient({
-      issuerBaseUrl: issuer.baseUrl,
-      holderBaseUrl: "http://127.0.0.1:1",
-      verifierBaseUrl: "http://127.0.0.1:2",
-    });
+    try {
+      const client = new LocalWalletClient({
+        issuerBaseUrl: issuer.baseUrl,
+        holderBaseUrl: "http://127.0.0.1:1",
+        verifierBaseUrl: "http://127.0.0.1:2",
+      });
 
-    await client.issueBadge("local-user");
+      await client.issueBadge("local-user");
 
-    expect(fetchSpy.mock.calls[0]?.[1]).toMatchObject({ cache: "no-store" });
-    expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+      expect(fetchSpy.mock.calls[0]?.[1]).toMatchObject({ cache: "no-store" });
+      expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it("rejects an oversized valid-shaped chunked response without exposing its body", async () => {

@@ -1,7 +1,9 @@
 /// <reference types="node" />
 
+import { createServer, type Server } from "node:http";
+
 import request from "supertest";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   AuthorizationTransaction,
@@ -27,6 +29,7 @@ const config: DemoServerOptions["config"] = {
   VS_AGENT_VERIFIER_BASE_URL: "http://localhost:3201",
 };
 const APP_ORIGIN = new URL(config.DEMO_APP_REDIRECT_URI).origin;
+const servers: Server[] = [];
 
 const transaction: AuthorizationTransaction = {
   state: "expected-state",
@@ -116,6 +119,32 @@ function createOptions(
   };
 }
 
+async function startDemoServer(
+  options: DemoServerOptions = createOptions(),
+): Promise<Server> {
+  const server = createServer(createDemoServer(options).callback());
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  servers.push(server);
+  return server;
+}
+
+afterEach(async () => {
+  await Promise.all(
+    servers.splice(0).map(
+      (server) =>
+        new Promise<void>((resolve, reject) => {
+          server.closeAllConnections();
+          server.close((error) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        }),
+    ),
+  );
+});
+
 function cookieValue(
   response: request.Response,
   name: string,
@@ -160,8 +189,7 @@ async function login(options = createOptions()): Promise<{
   agent: ReturnType<typeof request.agent>;
   options: ReturnType<typeof createOptions>;
 }> {
-  const app = createDemoServer(options);
-  const agent = request.agent(app.callback());
+  const agent = request.agent(await startDemoServer(options));
   await agent.get("/login").expect(302);
   await agent
     .get("/callback")
@@ -173,7 +201,7 @@ async function login(options = createOptions()): Promise<{
 
 describe("OIDC application routes", () => {
   it("uses same-origin referrer policy so Chrome preserves the exact Origin required by CSRF checks", async () => {
-    const response = await request(createDemoServer(createOptions()).callback())
+    const response = await request(await startDemoServer())
       .get("/")
       .expect(200);
 
@@ -182,7 +210,7 @@ describe("OIDC application routes", () => {
 
   it("/login stores an opaque transaction and sets an HttpOnly SameSite=Lax cookie", async () => {
     const options = createOptions();
-    const response = await request(createDemoServer(options).callback())
+    const response = await request(await startDemoServer(options))
       .get("/login")
       .expect(302);
     const cookie = cookieValue(response, "verana_auth");
@@ -206,7 +234,7 @@ describe("OIDC application routes", () => {
     "rejects a %s callback state without token exchange",
     async (_name, state) => {
       const options = createOptions();
-      const agent = request.agent(createDemoServer(options).callback());
+      const agent = request.agent(await startDemoServer(options));
       await agent.get("/login").expect(302);
       const callback = agent
         .get("/callback")
@@ -222,7 +250,7 @@ describe("OIDC application routes", () => {
 
   it("passes the stored state, nonce, and PKCE verifier into token exchange", async () => {
     const options = createOptions();
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     await agent.get("/login").expect(302);
 
     await agent
@@ -249,7 +277,7 @@ describe("OIDC application routes", () => {
     },
   ])("does not create a session for an invalid $name", async ({ identity }) => {
     const options = createOptions(identity);
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     await agent.get("/login").expect(302);
 
     const response = await agent
@@ -308,10 +336,10 @@ describe("OIDC application routes", () => {
 
   it("requires a server-side opaque session cookie", async () => {
     const options = createOptions();
-    const app = createDemoServer(options);
+    const server = await startDemoServer(options);
 
-    await request(app.callback()).get("/profile").expect(401);
-    await request(app.callback())
+    await request(server).get("/profile").expect(401);
+    await request(server)
       .get("/profile")
       .set(
         "Cookie",
@@ -322,7 +350,7 @@ describe("OIDC application routes", () => {
 
   it("sets the authenticated session cookie HttpOnly and SameSite=Lax", async () => {
     const options = createOptions();
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     await agent.get("/login").expect(302);
 
     const response = await agent
@@ -406,7 +434,7 @@ describe("OIDC application routes", () => {
 
 describe("local-holder routes", () => {
   it("renders one cryptographically random server-bound CSRF token into every wallet form", async () => {
-    const agent = request.agent(createDemoServer(createOptions()).callback());
+    const agent = request.agent(await startDemoServer());
 
     const response = await agent.get("/wallet").expect(200);
     const token = csrfToken(response);
@@ -422,7 +450,7 @@ describe("local-holder routes", () => {
     "rejects wallet issue with Origin %j before any upstream call",
     async (origin) => {
       const options = createOptions();
-      const agent = request.agent(createDemoServer(options).callback());
+      const agent = request.agent(await startDemoServer(options));
       const token = await openWallet(agent);
       const mutation = agent
         .post("/wallet/issue")
@@ -442,7 +470,7 @@ describe("local-holder routes", () => {
     "rejects wallet issue with CSRF token %j before any upstream call",
     async (token) => {
       const options = createOptions();
-      const agent = request.agent(createDemoServer(options).callback());
+      const agent = request.agent(await startDemoServer(options));
       await openWallet(agent);
       const body = {
         ...(token ? { csrfToken: token } : {}),
@@ -470,7 +498,7 @@ describe("local-holder routes", () => {
     "protects %s even when a localhost cross-port page submits the form",
     async (path, method) => {
       const options = createOptions();
-      const agent = request.agent(createDemoServer(options).callback());
+      const agent = request.agent(await startDemoServer(options));
       await openWallet(agent);
 
       const response = await agent
@@ -491,7 +519,7 @@ describe("local-holder routes", () => {
 
   it("issues exact ACME employee claims and accepts only through the local holder", async () => {
     const options = createOptions();
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
 
     const response = await walletMutation(agent, "/wallet/issue", token, {
@@ -507,7 +535,7 @@ describe("local-holder routes", () => {
   });
 
   it("shows the honest local-only evidence labels and sequence", async () => {
-    const response = await request(createDemoServer(createOptions()).callback())
+    const response = await request(await startDemoServer())
       .get("/wallet")
       .expect(200);
 
@@ -521,7 +549,7 @@ describe("local-holder routes", () => {
 
   it("shares only the server-stored gate returned by a positive resolution", async () => {
     const options = createOptions();
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
     await walletMutation(agent, "/wallet/resolve", token, {
       authorizationRequest: "openid4vp://broker-request",
@@ -548,7 +576,7 @@ describe("local-holder routes", () => {
       ...positiveResolution,
       verdict,
     });
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
 
     const resolved = await walletMutation(agent, "/wallet/resolve", token, {
@@ -574,7 +602,7 @@ describe("local-holder routes", () => {
       },
     });
 
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
     const response = await walletMutation(agent, "/wallet/resolve", token, {
       authorizationRequest: "openid4vp://broker-request",
@@ -591,7 +619,7 @@ describe("local-holder routes", () => {
       new Error("upstream credential and authorization request body"),
     );
 
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
     const response = await walletMutation(agent, "/wallet/resolve", token, {
       authorizationRequest: "openid4vp://sensitive-request",
@@ -612,7 +640,7 @@ describe("local-holder routes", () => {
       await shareGate;
       return { shared: true, status: 200 };
     });
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
     await walletMutation(agent, "/wallet/resolve", token, {
       authorizationRequest: "openid4vp://broker-request",
@@ -639,7 +667,7 @@ describe("local-holder routes", () => {
     options.walletClient.share.mockRejectedValueOnce(
       new Error("holder response lost after submission"),
     );
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
     await walletMutation(agent, "/wallet/resolve", token, {
       authorizationRequest: "openid4vp://broker-request",
@@ -665,7 +693,7 @@ describe("local-holder routes", () => {
     options.walletClient.resolveRequest
       .mockResolvedValueOnce(positiveResolution)
       .mockImplementationOnce(async () => await secondResolve);
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
     await walletMutation(agent, "/wallet/resolve", token, {
       authorizationRequest: "openid4vp://first-request",
@@ -695,7 +723,7 @@ describe("local-holder routes", () => {
     options.walletClient.resolveRequest
       .mockResolvedValueOnce(positiveResolution)
       .mockRejectedValueOnce(new Error("new resolver failure"));
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
     await walletMutation(agent, "/wallet/resolve", token, {
       authorizationRequest: "openid4vp://first-request",
@@ -721,7 +749,7 @@ describe("local-holder routes", () => {
         gateId: "gate-denied-2",
         verdict: "TRUSTED_NOT_AUTHORIZED",
       });
-    const agent = request.agent(createDemoServer(options).callback());
+    const agent = request.agent(await startDemoServer(options));
     const token = await openWallet(agent);
     await walletMutation(agent, "/wallet/resolve", token, {
       authorizationRequest: "openid4vp://first-request",

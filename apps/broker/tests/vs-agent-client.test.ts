@@ -29,8 +29,6 @@ async function listen(
 }
 
 afterEach(async () => {
-  vi.restoreAllMocks();
-
   await Promise.all(
     servers.splice(0).map(
       (server) =>
@@ -101,17 +99,21 @@ describe("VsAgentClient", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation((input, init) => nativeFetch(input, init));
 
-    await expect(
-      new VsAgentClient(baseUrl).createRequest("trusted"),
-    ).resolves.toEqual({
-      authorizationRequest: "openid4vp://request",
-      sessionId: "vs-1",
-    });
-    expect(requestBody).toEqual({ tenant: "trusted" });
-    expect(fetchSpy.mock.calls[0]?.[1]).toMatchObject({
-      cache: "no-store",
-    });
-    expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+    try {
+      await expect(
+        new VsAgentClient(baseUrl).createRequest("trusted"),
+      ).resolves.toEqual({
+        authorizationRequest: "openid4vp://request",
+        sessionId: "vs-1",
+      });
+      expect(requestBody).toEqual({ tenant: "trusted" });
+      expect(fetchSpy.mock.calls[0]?.[1]).toMatchObject({
+        cache: "no-store",
+      });
+      expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it.each([
