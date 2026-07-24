@@ -2,6 +2,7 @@ import Provider, { interactionPolicy, type JWKS } from "oidc-provider";
 
 import type { AccountStore } from "./account-store.js";
 import type { BrokerConfig } from "./config.js";
+import { createProcessLocalAdapterFactory } from "./process-local-adapter.js";
 
 export const loginOnlyPolicy = interactionPolicy.base();
 loginOnlyPolicy.remove("consent");
@@ -18,6 +19,7 @@ export function createOidcProvider({
   privateJwks,
 }: CreateOidcProviderOptions): Provider {
   return new Provider(config.BROKER_ISSUER, {
+    adapter: createProcessLocalAdapterFactory(),
     clients: [
       {
         client_id: config.BROKER_CLIENT_ID,
@@ -43,6 +45,9 @@ export function createOidcProvider({
     scopes: ["openid"],
     responseTypes: ["code"],
     clientAuthMethods: ["client_secret_post"],
+    cookies: {
+      keys: [config.BROKER_COOKIE_SECRET],
+    },
     pkce: {
       required: () => true,
     },

@@ -14,6 +14,7 @@ export async function generateLocalData(
   await mkdir(output, { recursive: true });
   const appSecret = secret();
   const brokerSecret = secret();
+  const brokerCookieSecret = secret();
   const pairwiseSecret = secret();
   const sessionSecret = secret();
   const { privateKey } = await generateKeyPair("ES256", { extractable: true });
@@ -27,6 +28,7 @@ export async function generateLocalData(
   const env = [
     `PLAYGROUND_APP_CLIENT_SECRET=${appSecret}`,
     `BROKER_CLIENT_SECRET=${brokerSecret}`,
+    `BROKER_COOKIE_SECRET=${brokerCookieSecret}`,
     `PAIRWISE_SUB_SECRET=${pairwiseSecret}`,
     `SESSION_SECRET=${sessionSecret}`,
     "",

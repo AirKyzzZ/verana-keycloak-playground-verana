@@ -164,7 +164,7 @@ export function attachInteractionRoutes(
     let transaction = transactionStore.get(uid);
     let status: PublicStatus;
 
-    if (!transaction && !startedInteractions.has(uid)) {
+    if (!transaction && (!startedInteractions.has(uid) || starts.has(uid))) {
       try {
         transaction = await startInteraction(uid);
         status = publicStatus(transaction.status);

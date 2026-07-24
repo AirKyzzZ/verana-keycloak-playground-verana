@@ -1,13 +1,14 @@
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
 
-loadDotenv({ path: ".data/.env", override: false });
+loadDotenv({ path: ".data/.env", override: false, quiet: true });
 
 export const brokerConfigSchema = z.object({
   BROKER_ISSUER: z.string().url().default("http://localhost:3001"),
   BROKER_PORT: z.coerce.number().int().min(1).max(65535).default(3001),
   BROKER_CLIENT_ID: z.string().default("keycloak-playground"),
   BROKER_CLIENT_SECRET: z.string().min(32),
+  BROKER_COOKIE_SECRET: z.string().min(32),
   KEYCLOAK_BROKER_REDIRECT_URI: z
     .string()
     .url()

@@ -14,7 +14,25 @@ describe("generateLocalData", () => {
       await readFile(join(output, "broker-jwks.json"), "utf8"),
     );
 
+    const secrets = Object.fromEntries(
+      env
+        .trim()
+        .split("\n")
+        .map((line) => line.split("=", 2)),
+    );
+
+    expect(secrets.BROKER_COOKIE_SECRET).toEqual(expect.any(String));
+    expect(secrets.BROKER_COOKIE_SECRET).toHaveLength(43);
     expect(env).toContain("PAIRWISE_SUB_SECRET=");
+    expect(
+      new Set([
+        secrets.PLAYGROUND_APP_CLIENT_SECRET,
+        secrets.BROKER_CLIENT_SECRET,
+        secrets.PAIRWISE_SUB_SECRET,
+        secrets.SESSION_SECRET,
+        secrets.BROKER_COOKIE_SECRET,
+      ]).size,
+    ).toBe(5);
     expect(jwks.keys[0]).toMatchObject({
       kty: "EC",
       crv: "P-256",

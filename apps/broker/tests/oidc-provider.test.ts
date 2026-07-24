@@ -11,6 +11,7 @@ const config: BrokerConfig = {
   BROKER_PORT: 3001,
   BROKER_CLIENT_ID: "keycloak-playground",
   BROKER_CLIENT_SECRET: "broker-client-secret-at-least-32-bytes",
+  BROKER_COOKIE_SECRET: "broker-cookie-secret-at-least-32-bytes",
   KEYCLOAK_BROKER_REDIRECT_URI:
     "http://localhost:8080/realms/verana-playground/broker/verana-wallet/endpoint",
   VS_AGENT_VERIFIER_BASE_URL: "http://localhost:3201",
@@ -114,5 +115,53 @@ describe("OIDC provider", () => {
 
   it("uses only the login prompt for the first-party client", () => {
     expect(loginOnlyPolicy.map(({ name }) => name)).toEqual(["login"]);
+  });
+
+  it("exposes only the configured public ES256 signing key", async () => {
+    const provider = createOidcProvider({
+      accountStore: new AccountStore(),
+      config,
+      privateJwks,
+    });
+
+    const response = await request(provider.callback()).get("/jwks");
+
+    expect(response.status).toBe(200);
+    expect(response.body.keys).toHaveLength(1);
+    expect(response.body.keys[0]).toMatchObject({
+      alg: "ES256",
+      crv: "P-256",
+      kid: "broker-test",
+      kty: "EC",
+      use: "sig",
+      x: expect.any(String),
+      y: expect.any(String),
+    });
+    expect(response.body.keys[0]).not.toHaveProperty("d");
+  });
+
+  it("isolates process-local OIDC state between provider instances", async () => {
+    const first = createOidcProvider({
+      accountStore: new AccountStore(),
+      config,
+      privateJwks,
+    });
+    const second = createOidcProvider({
+      accountStore: new AccountStore(),
+      config,
+      privateJwks,
+    });
+    await first.Interaction.adapter.upsert(
+      "shared-interaction",
+      { uid: "shared-interaction" },
+      300,
+    );
+
+    await expect(
+      first.Interaction.adapter.find("shared-interaction"),
+    ).resolves.toMatchObject({ uid: "shared-interaction" });
+    await expect(
+      second.Interaction.adapter.find("shared-interaction"),
+    ).resolves.toBeUndefined();
   });
 });

@@ -49,6 +49,7 @@ describe("broker configuration", () => {
   it("keeps the broker and verifier VS Agent on distinct default ports", () => {
     const config = loadBrokerConfig({
       BROKER_CLIENT_SECRET: "b".repeat(32),
+      BROKER_COOKIE_SECRET: "c".repeat(32),
       EXPECTED_VCT: "https://demo.example/vct",
       EXPECTED_VTJSC_ID: "https://demo.example/schema",
       PAIRWISE_SUB_SECRET: "p".repeat(32),
@@ -57,6 +58,17 @@ describe("broker configuration", () => {
     expect(config.BROKER_ISSUER).toBe("http://localhost:3001");
     expect(config.BROKER_PORT).toBe(3001);
     expect(config.VS_AGENT_VERIFIER_BASE_URL).toBe("http://localhost:3201");
+  });
+
+  it("requires a dedicated broker cookie signing secret", () => {
+    expect(() =>
+      loadBrokerConfig({
+        BROKER_CLIENT_SECRET: "b".repeat(32),
+        EXPECTED_VCT: "https://demo.example/vct",
+        EXPECTED_VTJSC_ID: "https://demo.example/schema",
+        PAIRWISE_SUB_SECRET: "p".repeat(32),
+      }),
+    ).toThrow();
   });
 });
 
