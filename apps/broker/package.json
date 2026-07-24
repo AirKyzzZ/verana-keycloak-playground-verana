@@ -1,0 +1,29 @@
+{
+  "name": "@verana-playground/broker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@koa/router": "15.7.0",
+    "dotenv": "17.4.2",
+    "jose": "6.2.4",
+    "koa": "3.2.1",
+    "koa-bodyparser": "4.4.1",
+    "koa-mount": "4.2.0",
+    "oidc-provider": "9.10.0",
+    "qrcode": "1.5.4",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/koa": "2.15.0",
+    "@types/koa-bodyparser": "4.3.12",
+    "@types/koa-mount": "4.0.5",
+    "@types/oidc-provider": "9.5.0",
+    "@types/qrcode": "1.5.6",
+    "supertest": "7.2.2"
+  }
+}

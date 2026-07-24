@@ -1,2 +1,7 @@
 .worktrees/
 .superpowers/
+.data/
+node_modules/
+dist/
+.env
+coverage/
