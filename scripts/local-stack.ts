@@ -7,6 +7,7 @@ import {
   open,
   readFile,
   realpath,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -49,10 +50,16 @@ interface HostProcess {
   startToken: string;
 }
 
+interface FileSystemIdentity {
+  dev: number | bigint;
+  ino: number | bigint;
+}
+
 interface LocalStackState {
   version: 1;
   composeProject: typeof LOCAL_CONTROLLED.composeProject;
   twitterWasRunning: boolean;
+  twitterStopped: boolean;
   hostProcess?: HostProcess;
   ownedDataFiles: readonly (typeof generatedDataFiles)[number][];
   vsSourceCommit: string;
@@ -88,6 +95,7 @@ export interface LifecycleDependencies {
   fetch?: typeof fetch;
   randomToken?: () => string;
   now?: () => Date;
+  rename?: (source: string, destination: string) => Promise<void>;
   write?: (line: string) => void;
 }
 
@@ -150,11 +158,13 @@ export async function up(
     version: 1,
     composeProject: LOCAL_CONTROLLED.composeProject,
     twitterWasRunning: checked.twitterWasRunning,
+    twitterStopped: false,
     vsSourceCommit: checked.vsSourceCommit,
     startedAt: context.now().toISOString(),
     ownedDataFiles: generatedDataFiles,
   };
   let stateWritten = false;
+  let currentState = initialState;
 
   try {
     await writeState(context, initialState);
@@ -167,6 +177,8 @@ export async function up(
         "stop",
         LOCAL_CONTROLLED.twitterContainer,
       ]);
+      currentState = { ...initialState, twitterStopped: true };
+      await writeState(context, currentState);
     }
 
     await runCompose(context, ["build", "issuer"]);
@@ -192,7 +204,7 @@ export async function up(
       environment,
       startToken,
     });
-    await writeState(context, { ...initialState, hostProcess });
+    await writeState(context, { ...currentState, hostProcess });
 
     await waitForHostServices(context.fetch);
     context.write("LOCAL_CONTROLLED http://127.0.0.1:3000");
@@ -200,7 +212,7 @@ export async function up(
     context.write("LOCAL_CONTROLLED http://127.0.0.1:3099/health");
   } catch (error) {
     if (stateWritten) {
-      await cleanupAfterFailedStartup(context);
+      await cleanupAfterFailedStartup(context, currentState);
     }
     throw error;
   }
@@ -258,6 +270,7 @@ function createContext(dependencies: LifecycleDependencies) {
   return {
     root: projectRoot,
     dataDirectory,
+    dataDirectoryIdentity: undefined as FileSystemIdentity | undefined,
     lifecycleDirectory: join(dataDirectory, lifecycleDirectoryName),
     vsSourcePath,
     nodeVersion: dependencies.nodeVersion ?? process.version,
@@ -272,6 +285,7 @@ function createContext(dependencies: LifecycleDependencies) {
     randomToken:
       dependencies.randomToken ?? (() => randomBytes(32).toString("hex")),
     now: dependencies.now ?? (() => new Date()),
+    rename: dependencies.rename ?? rename,
     write: dependencies.write ?? console.log,
   };
 }
@@ -309,6 +323,18 @@ async function assertDestructivePaths(
       "LOCAL_CONTROLLED data path changed outside the repository",
     );
   }
+  const dataDetails = await lstat(context.dataDirectory);
+  if (!dataDetails.isDirectory() || dataDetails.isSymbolicLink()) {
+    throw new Error("LOCAL_CONTROLLED .data must be a regular directory");
+  }
+  const dataIdentity = { dev: dataDetails.dev, ino: dataDetails.ino };
+  if (
+    context.dataDirectoryIdentity &&
+    !sameFileSystemIdentity(context.dataDirectoryIdentity, dataIdentity)
+  ) {
+    throw new Error("LOCAL_CONTROLLED .data directory identity changed");
+  }
+  context.dataDirectoryIdentity ??= dataIdentity;
 }
 
 function statePath(context: ReturnType<typeof createContext>): string {
@@ -638,6 +664,7 @@ async function writeState(
   await assertDestructivePaths(context);
   const path = statePath(context);
   await writeFile(path, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  await assertDestructivePaths(context);
   await chmod(path, 0o600);
 }
 
@@ -665,6 +692,7 @@ function isState(value: unknown): value is LocalStackState {
     state.version !== 1 ||
     state.composeProject !== LOCAL_CONTROLLED.composeProject ||
     typeof state.twitterWasRunning !== "boolean" ||
+    typeof state.twitterStopped !== "boolean" ||
     typeof state.vsSourceCommit !== "string" ||
     typeof state.startedAt !== "string" ||
     !Array.isArray(state.ownedDataFiles) ||
@@ -715,10 +743,14 @@ async function stopVerifiedHostProcess(
 
 async function cleanupAfterFailedStartup(
   context: ReturnType<typeof createContext>,
+  startupState: LocalStackState,
 ): Promise<void> {
   const state = await readState(context);
   if (!state) return;
-  const errors = await teardown(context, state);
+  const errors = await teardown(context, {
+    ...state,
+    twitterStopped: state.twitterStopped || startupState.twitterStopped,
+  });
   if (errors.length > 0) {
     context.write(
       `LOCAL_CONTROLLED cleanup failed: ${errors.map((error) => error.message).join("; ")}`,
@@ -750,7 +782,7 @@ async function teardown(
   }
 
   try {
-    if (state.twitterWasRunning) {
+    if (state.twitterStopped) {
       await requireSuccess(
         context.runner,
         "docker",
@@ -802,45 +834,178 @@ async function removeOwnedData(
   context: ReturnType<typeof createContext>,
   state: LocalStackState,
 ): Promise<void> {
-  await assertDestructivePaths(context);
   for (const file of state.ownedDataFiles) {
-    const path = ownedDataPath(context, file);
-    try {
-      const details = await lstat(path);
-      if (!details.isFile() || details.isSymbolicLink()) {
-        throw new Error(
-          `LOCAL_CONTROLLED refuses to delete non-regular ${file}`,
-        );
-      }
-      await rm(path, { force: false });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
-    }
+    await removeOwnedEntry(
+      context,
+      ownedDataPath(context, file),
+      "file",
+      `generated data file ${file}`,
+    );
   }
-  try {
-    const details = await lstat(context.lifecycleDirectory);
-    if (!details.isDirectory() || details.isSymbolicLink()) {
-      throw new Error(
-        "LOCAL_CONTROLLED refuses to delete invalid lifecycle directory",
-      );
-    }
-    await rm(context.lifecycleDirectory, { recursive: true, force: false });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
+  await removeOwnedEntry(
+    context,
+    context.lifecycleDirectory,
+    "directory",
+    "lifecycle directory",
+  );
 }
 
 async function removeState(
   context: ReturnType<typeof createContext>,
 ): Promise<void> {
-  await assertDestructivePaths(context);
-  const path = statePath(context);
-  const details = await lstat(path);
-  if (!details.isFile() || details.isSymbolicLink()) {
-    throw new Error("LOCAL_CONTROLLED refuses to delete invalid state file");
+  await removeOwnedEntry(context, statePath(context), "file", "state file");
+}
+
+type OwnedEntryKind = "file" | "directory";
+
+interface OwnedEntryIdentity extends FileSystemIdentity {
+  kind: OwnedEntryKind;
+}
+
+async function removeOwnedEntry(
+  context: ReturnType<typeof createContext>,
+  path: string,
+  expectedKind: OwnedEntryKind,
+  label: string,
+): Promise<void> {
+  let quarantine: string;
+  let identity: OwnedEntryIdentity;
+  try {
+    ({ quarantine, identity } = await quarantineOwnedEntry(
+      context,
+      path,
+      expectedKind,
+      label,
+    ));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
   }
-  await rm(path, { force: false });
+
+  await deleteQuarantinedEntry(context, quarantine, identity, label);
+}
+
+async function quarantineOwnedEntry(
+  context: ReturnType<typeof createContext>,
+  path: string,
+  expectedKind: OwnedEntryKind,
+  label: string,
+): Promise<{ quarantine: string; identity: OwnedEntryIdentity }> {
+  await assertDestructivePaths(context);
+  const identity = ownedEntryIdentity(await lstat(path), expectedKind, label);
+  const quarantine = join(
+    dirname(path),
+    `.local-stack-quarantine-${randomBytes(16).toString("hex")}`,
+  );
+  await assertQuarantinePathAvailable(quarantine);
+
+  await assertDestructivePaths(context);
+  await context.rename(path, quarantine);
+
+  try {
+    const quarantinedIdentity = ownedEntryIdentity(
+      await lstat(quarantine),
+      expectedKind,
+      label,
+    );
+    if (sameOwnedEntry(identity, quarantinedIdentity)) {
+      return { quarantine, identity };
+    }
+  } catch (error) {
+    await recoverQuarantinedEntry(context, quarantine, path, label);
+    throw error;
+  }
+
+  await recoverQuarantinedEntry(context, quarantine, path, label);
+  throw new Error(`LOCAL_CONTROLLED ${label} changed during quarantine`);
+}
+
+async function assertQuarantinePathAvailable(path: string): Promise<void> {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error("LOCAL_CONTROLLED quarantine path already exists");
+}
+
+function ownedEntryIdentity(
+  details: Awaited<ReturnType<typeof lstat>>,
+  expectedKind: OwnedEntryKind,
+  label: string,
+): OwnedEntryIdentity {
+  const isExpectedKind =
+    expectedKind === "file" ? details.isFile() : details.isDirectory();
+  if (!isExpectedKind || details.isSymbolicLink()) {
+    throw new Error(`LOCAL_CONTROLLED refuses to delete invalid ${label}`);
+  }
+  return { dev: details.dev, ino: details.ino, kind: expectedKind };
+}
+
+function sameOwnedEntry(
+  left: OwnedEntryIdentity,
+  right: OwnedEntryIdentity,
+): boolean {
+  return sameFileSystemIdentity(left, right) && left.kind === right.kind;
+}
+
+function sameFileSystemIdentity(
+  left: FileSystemIdentity,
+  right: FileSystemIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function recoverQuarantinedEntry(
+  context: ReturnType<typeof createContext>,
+  quarantine: string,
+  originalPath: string,
+  label: string,
+): Promise<void> {
+  await assertDestructivePaths(context);
+  try {
+    await lstat(originalPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await assertDestructivePaths(context);
+    await context.rename(quarantine, originalPath);
+    return;
+  }
+
+  const recoveryPath = join(
+    dirname(originalPath),
+    `.local-stack-recovery-${randomBytes(16).toString("hex")}`,
+  );
+  await assertQuarantinePathAvailable(recoveryPath);
+  await assertDestructivePaths(context);
+  await context.rename(quarantine, recoveryPath);
+  throw new Error(
+    `LOCAL_CONTROLLED ${label} changed during quarantine; recovery preserved at ${recoveryPath}`,
+  );
+}
+
+async function deleteQuarantinedEntry(
+  context: ReturnType<typeof createContext>,
+  quarantine: string,
+  identity: OwnedEntryIdentity,
+  label: string,
+): Promise<void> {
+  await assertDestructivePaths(context);
+  const currentIdentity = ownedEntryIdentity(
+    await lstat(quarantine),
+    identity.kind,
+    label,
+  );
+  if (!sameOwnedEntry(identity, currentIdentity)) {
+    await recoverQuarantinedEntry(context, quarantine, quarantine, label);
+    throw new Error(`LOCAL_CONTROLLED ${label} changed before deletion`);
+  }
+  await assertDestructivePaths(context);
+  await rm(quarantine, {
+    recursive: identity.kind === "directory",
+    force: false,
+  });
 }
 
 async function loadSanitizedEnvironment(

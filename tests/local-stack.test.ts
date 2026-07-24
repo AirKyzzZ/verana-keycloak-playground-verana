@@ -3,6 +3,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename as renamePath,
   rm,
   stat,
   symlink,
@@ -36,6 +37,7 @@ interface FakeBehavior {
   failCommand?: readonly string[];
   failComposeDown?: boolean;
   failTwitterStart?: boolean;
+  failTwitterStop?: boolean;
   composeResources?: string;
   composeVolumes?: string;
 }
@@ -90,6 +92,9 @@ class FakeRunner implements CommandRunner {
       return { exitCode: 1, stdout: "", stderr: "forced failure" };
     }
     if (command === "docker" && args[0] === "stop") {
+      if (this.behavior.failTwitterStop) {
+        return { exitCode: 1, stdout: "", stderr: "Twitter stop failed" };
+      }
       this.behavior.twitterRunning = false;
     }
     if (command === "docker" && args[0] === "start") {
@@ -434,7 +439,7 @@ describe("guarded local controlled stack lifecycle", () => {
     ).resolves.toBe("keep me too");
   });
 
-  it("restores Twitter when partial startup data generation fails", async () => {
+  it("does not start Twitter when data generation fails before this run stops it", async () => {
     const root = await makeRoot();
     const runner = new FakeRunner({ twitterRunning: true });
     const deps = dependencies(runner, root);
@@ -444,6 +449,45 @@ describe("guarded local controlled stack lifecycle", () => {
 
     await expect(up(deps)).rejects.toThrow("generated data failed");
 
+    expect(runner.calls).not.toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
+    ]);
+  });
+
+  it("does not start Twitter when the exact Twitter stop fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      twitterRunning: true,
+      failTwitterStop: true,
+    });
+
+    await expect(up(dependencies(runner, root))).rejects.toThrow("docker stop");
+
+    expect(runner.calls).not.toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
+    ]);
+  });
+
+  it("restores Twitter after an environment failure that follows a successful stop", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({ twitterRunning: true });
+    const deps = dependencies(runner, root);
+    deps.generateData = async (output) => {
+      await writeFile(join(output, ".env"), "NODE_OPTIONS=--inspect\n");
+      await writeFile(
+        join(output, "local-controlled.env"),
+        "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
+      );
+    };
+
+    await expect(up(deps)).rejects.toThrow("host environment override");
+
+    expect(runner.calls).toContainEqual([
+      "docker",
+      ["stop", "twitter-bot-vs-agent"],
+    ]);
     expect(runner.calls).toContainEqual([
       "docker",
       ["start", "twitter-bot-vs-agent"],
@@ -506,6 +550,54 @@ describe("guarded local controlled stack lifecycle", () => {
     await expect(
       readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
     ).resolves.toContain("twitterWasRunning");
+  });
+
+  it("preserves an owned-file replacement that races lifecycle cleanup", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    const ownedFile = join(root, ".data", ".env");
+
+    await up(deps);
+    runner.setHostToken("verified-start-token");
+    deps.rename = async (source, destination) => {
+      if (source === ownedFile) {
+        await rm(source);
+        await writeFile(source, "replacement");
+      }
+      await renamePath(source, destination);
+    };
+
+    await expect(down(deps)).rejects.toThrow("changed during quarantine");
+    await expect(readFile(ownedFile, "utf8")).resolves.toBe("replacement");
+    await expect(
+      readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+    ).resolves.toContain("twitterStopped");
+  });
+
+  it("preserves a lifecycle-directory replacement that races cleanup", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    const lifecycleDirectory = join(root, ".data", "local-stack");
+
+    await up(deps);
+    await mkdir(lifecycleDirectory);
+    await writeFile(join(lifecycleDirectory, "host-process.log"), "owned log");
+    runner.setHostToken("verified-start-token");
+    deps.rename = async (source, destination) => {
+      if (source === lifecycleDirectory) {
+        await rm(source, { recursive: true });
+        await mkdir(source);
+        await writeFile(join(source, "replacement.log"), "replacement");
+      }
+      await renamePath(source, destination);
+    };
+
+    await expect(down(deps)).rejects.toThrow("changed during quarantine");
+    await expect(
+      readFile(join(lifecycleDirectory, "replacement.log"), "utf8"),
+    ).resolves.toBe("replacement");
   });
 
   it("runs every Compose operation from the validated repository root", async () => {
