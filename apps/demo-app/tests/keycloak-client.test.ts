@@ -223,6 +223,7 @@ describe("KeycloakClient", () => {
     expect(url.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
     expect(url.searchParams.get("response_type")).toBe("code");
     expect(url.searchParams.get("scope")).toBe("openid");
+    expect(url.searchParams.get("prompt")).toBe("login");
     expect(url.searchParams.get("state")).toBe(first.transaction.state);
     expect(url.searchParams.get("nonce")).toBe(first.transaction.nonce);
     expect(url.searchParams.get("code_challenge_method")).toBe("S256");

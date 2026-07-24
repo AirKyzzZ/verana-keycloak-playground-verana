@@ -68,6 +68,7 @@ export class KeycloakClient implements KeycloakClientContract {
     const url = buildAuthorizationUrl(this.#configuration, {
       redirect_uri: this.#redirectUri,
       scope: "openid",
+      prompt: "login",
       code_challenge: challenge,
       code_challenge_method: "S256",
       state,
