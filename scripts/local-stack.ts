@@ -4,6 +4,7 @@ import {
   chmod,
   lstat,
   mkdir,
+  mkdtemp,
   open,
   readFile,
   realpath,
@@ -161,7 +162,7 @@ export async function up(
     twitterStopped: false,
     vsSourceCommit: checked.vsSourceCommit,
     startedAt: context.now().toISOString(),
-    ownedDataFiles: generatedDataFiles,
+    ownedDataFiles: [],
   };
   let stateWritten = false;
   let currentState = initialState;
@@ -169,15 +170,14 @@ export async function up(
   try {
     await writeState(context, initialState);
     stateWritten = true;
-    await assertGeneratedDataTargetsAvailable(context);
-    await context.generateData(context.dataDirectory, context.vsSourcePath);
+    currentState = await generateAndPublishData(context, currentState);
 
     if (checked.twitterWasRunning) {
       await requireSuccess(context.runner, "docker", [
         "stop",
         LOCAL_CONTROLLED.twitterContainer,
       ]);
-      currentState = { ...initialState, twitterStopped: true };
+      currentState = { ...currentState, twitterStopped: true };
       await writeState(context, currentState);
     }
 
@@ -204,7 +204,8 @@ export async function up(
       environment,
       startToken,
     });
-    await writeState(context, { ...currentState, hostProcess });
+    currentState = { ...currentState, hostProcess };
+    await writeState(context, currentState);
 
     await waitForHostServices(context.fetch);
     context.write("LOCAL_CONTROLLED http://127.0.0.1:3000");
@@ -272,6 +273,8 @@ function createContext(dependencies: LifecycleDependencies) {
     dataDirectory,
     dataDirectoryIdentity: undefined as FileSystemIdentity | undefined,
     lifecycleDirectory: join(dataDirectory, lifecycleDirectoryName),
+    lifecycleDirectoryIdentity: undefined as FileSystemIdentity | undefined,
+    stagingDirectoryIdentities: new Map<string, FileSystemIdentity>(),
     vsSourcePath,
     nodeVersion: dependencies.nodeVersion ?? process.version,
     runner: dependencies.runner ?? systemRunner,
@@ -660,12 +663,26 @@ async function writeState(
   context: ReturnType<typeof createContext>,
   state: LocalStackState,
 ): Promise<void> {
-  await mkdir(context.dataDirectory, { recursive: true, mode: 0o700 });
-  await assertDestructivePaths(context);
-  const path = statePath(context);
-  await writeFile(path, `${JSON.stringify(state)}\n`, { mode: 0o600 });
-  await assertDestructivePaths(context);
-  await chmod(path, 0o600);
+  const stagingDirectory = await createStagingDirectory(context, "state");
+  const stagedStatePath = join(stagingDirectory, stateFileName);
+  await writePrivateStagedFile(
+    context,
+    stagingDirectory,
+    stagedStatePath,
+    `${JSON.stringify(state)}\n`,
+  );
+  await publishStagedFile(
+    context,
+    stagingDirectory,
+    stagedStatePath,
+    statePath(context),
+    "state file",
+    true,
+  );
+  const persisted = await readState(context);
+  if (!persisted || JSON.stringify(persisted) !== JSON.stringify(state)) {
+    throw new Error("LOCAL_CONTROLLED state publication cannot be verified");
+  }
 }
 
 async function readState(
@@ -673,14 +690,244 @@ async function readState(
 ): Promise<LocalStackState | undefined> {
   await assertDestructivePaths(context);
   try {
-    const parsed: unknown = JSON.parse(
-      await readFile(statePath(context), "utf8"),
-    );
+    const parsed = await readVerifiedState(statePath(context));
     if (!isState(parsed))
       throw new Error("LOCAL_CONTROLLED stack state is invalid");
     return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function readVerifiedState(path: string): Promise<unknown> {
+  const details = await lstat(path);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw new Error("LOCAL_CONTROLLED stack state is not a regular file");
+  }
+  return JSON.parse(await readFile(path, "utf8"));
+}
+
+async function createStagingDirectory(
+  context: ReturnType<typeof createContext>,
+  prefix: string,
+): Promise<string> {
+  await ensureLifecycleDirectory(context);
+  const stagingDirectory = await mkdtemp(
+    join(context.lifecycleDirectory, `${prefix}-`),
+  );
+  const details = await lstat(stagingDirectory);
+  if (!details.isDirectory() || details.isSymbolicLink()) {
+    throw new Error("LOCAL_CONTROLLED staging directory is invalid");
+  }
+  context.stagingDirectoryIdentities.set(stagingDirectory, {
+    dev: details.dev,
+    ino: details.ino,
+  });
+  await ensureLifecycleDirectory(context);
+  await chmod(stagingDirectory, 0o700);
+  return stagingDirectory;
+}
+
+async function assertStagingDirectory(
+  context: ReturnType<typeof createContext>,
+  stagingDirectory: string,
+): Promise<void> {
+  if (dirname(stagingDirectory) !== context.lifecycleDirectory) {
+    throw new Error("LOCAL_CONTROLLED staging directory is outside lifecycle");
+  }
+  const expectedIdentity =
+    context.stagingDirectoryIdentities.get(stagingDirectory);
+  if (!expectedIdentity) {
+    throw new Error("LOCAL_CONTROLLED staging directory is untracked");
+  }
+  await ensureLifecycleDirectory(context);
+  const details = await lstat(stagingDirectory);
+  if (!details.isDirectory() || details.isSymbolicLink()) {
+    throw new Error("LOCAL_CONTROLLED staging directory is invalid");
+  }
+  if (!sameFileSystemIdentity(expectedIdentity, details)) {
+    throw new Error("LOCAL_CONTROLLED staging directory identity changed");
+  }
+}
+
+async function ensureLifecycleDirectory(
+  context: ReturnType<typeof createContext>,
+): Promise<void> {
+  await ensureDataDirectory(context);
+  await assertDestructivePaths(context);
+  try {
+    await lstat(context.lifecycleDirectory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await assertDestructivePaths(context);
+    try {
+      await mkdir(context.lifecycleDirectory, { mode: 0o700 });
+    } catch (mkdirError) {
+      if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw mkdirError;
+      }
+    }
+  }
+
+  await assertDestructivePaths(context);
+  const details = await lstat(context.lifecycleDirectory);
+  if (!details.isDirectory() || details.isSymbolicLink()) {
+    throw new Error("LOCAL_CONTROLLED lifecycle directory is invalid");
+  }
+  const identity = { dev: details.dev, ino: details.ino };
+  if (
+    context.lifecycleDirectoryIdentity &&
+    !sameFileSystemIdentity(context.lifecycleDirectoryIdentity, identity)
+  ) {
+    throw new Error("LOCAL_CONTROLLED lifecycle directory identity changed");
+  }
+  context.lifecycleDirectoryIdentity ??= identity;
+}
+
+async function ensureDataDirectory(
+  context: ReturnType<typeof createContext>,
+): Promise<void> {
+  await assertSafePaths(context.root, context.dataDirectory);
+  try {
+    await lstat(context.dataDirectory);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await assertSafePaths(context.root, context.dataDirectory);
+  try {
+    await mkdir(context.dataDirectory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+}
+
+async function writePrivateStagedFile(
+  context: ReturnType<typeof createContext>,
+  stagingDirectory: string,
+  path: string,
+  contents: string,
+): Promise<void> {
+  if (dirname(path) !== stagingDirectory) {
+    throw new Error("LOCAL_CONTROLLED staging path is invalid");
+  }
+  await assertStagingDirectory(context, stagingDirectory);
+  await writeFile(path, contents, { flag: "wx", mode: 0o600 });
+  const details = await lstat(path);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw new Error("LOCAL_CONTROLLED staged state file is invalid");
+  }
+  await assertStagingDirectory(context, stagingDirectory);
+  await chmod(path, 0o600);
+}
+
+async function generateAndPublishData(
+  context: ReturnType<typeof createContext>,
+  state: LocalStackState,
+): Promise<LocalStackState> {
+  const stagingDirectory = await createStagingDirectory(context, "data");
+  await context.generateData(stagingDirectory, context.vsSourcePath);
+  for (const file of generatedDataFiles) {
+    await verifyStagedGeneratedFile(context, stagingDirectory, file);
+  }
+  await assertGeneratedDataTargetsAvailable(context);
+
+  let publishedState = state;
+  for (const file of generatedDataFiles) {
+    await publishStagedFile(
+      context,
+      stagingDirectory,
+      join(stagingDirectory, file),
+      ownedDataPath(context, file),
+      `generated data file ${file}`,
+      false,
+    );
+    publishedState = {
+      ...publishedState,
+      ownedDataFiles: [...publishedState.ownedDataFiles, file],
+    };
+    await writeState(context, publishedState);
+  }
+  return publishedState;
+}
+
+async function verifyStagedGeneratedFile(
+  context: ReturnType<typeof createContext>,
+  stagingDirectory: string,
+  file: (typeof generatedDataFiles)[number],
+): Promise<void> {
+  const path = join(stagingDirectory, file);
+  if (dirname(path) !== stagingDirectory) {
+    throw new Error("LOCAL_CONTROLLED staged data path is invalid");
+  }
+  const details = await lstat(path);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw new Error(`LOCAL_CONTROLLED staged ${file} is invalid`);
+  }
+  await assertStagingDirectory(context, stagingDirectory);
+  await chmod(path, 0o600);
+}
+
+async function publishStagedFile(
+  context: ReturnType<typeof createContext>,
+  stagingDirectory: string,
+  source: string,
+  destination: string,
+  label: string,
+  allowVerifiedPriorState: boolean,
+): Promise<void> {
+  if (dirname(source) !== stagingDirectory) {
+    throw new Error("LOCAL_CONTROLLED publication source is invalid");
+  }
+  await assertStagingDirectory(context, stagingDirectory);
+  await assertPublishTarget(
+    context,
+    destination,
+    label,
+    allowVerifiedPriorState,
+  );
+  await assertDestructivePaths(context);
+  await assertStagingDirectory(context, stagingDirectory);
+  const sourceDetails = await lstat(source);
+  if (!sourceDetails.isFile() || sourceDetails.isSymbolicLink()) {
+    throw new Error(`LOCAL_CONTROLLED staged ${label} is invalid`);
+  }
+  await assertDestructivePaths(context);
+  await assertStagingDirectory(context, stagingDirectory);
+  await context.rename(source, destination);
+  const destinationDetails = await lstat(destination);
+  if (!destinationDetails.isFile() || destinationDetails.isSymbolicLink()) {
+    throw new Error(`LOCAL_CONTROLLED published ${label} is invalid`);
+  }
+}
+
+async function assertPublishTarget(
+  context: ReturnType<typeof createContext>,
+  path: string,
+  label: string,
+  allowVerifiedPriorState: boolean,
+): Promise<void> {
+  await assertDestructivePaths(context);
+  try {
+    const details = await lstat(path);
+    if (details.isSymbolicLink()) return;
+    if (!details.isFile()) {
+      throw new Error(`LOCAL_CONTROLLED refuses to replace invalid ${label}`);
+    }
+    if (!allowVerifiedPriorState) {
+      throw new Error(
+        `LOCAL_CONTROLLED refuses to replace existing regular ${label}`,
+      );
+    }
+    const existingState = await readVerifiedState(path);
+    if (!isState(existingState)) {
+      throw new Error(
+        "LOCAL_CONTROLLED refuses to replace unverified prior state",
+      );
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
 }
@@ -745,17 +992,54 @@ async function cleanupAfterFailedStartup(
   context: ReturnType<typeof createContext>,
   startupState: LocalStackState,
 ): Promise<void> {
-  const state = await readState(context);
-  if (!state) return;
+  let state: LocalStackState | undefined;
+  try {
+    state = await readState(context);
+  } catch (error) {
+    await restoreTwitterAfterUnreadableState(context, startupState, error);
+    return;
+  }
+  if (!state) {
+    await restoreTwitterAfterUnreadableState(
+      context,
+      startupState,
+      new Error("LOCAL_CONTROLLED stack state disappeared during startup"),
+    );
+    return;
+  }
   const errors = await teardown(context, {
     ...state,
     twitterStopped: state.twitterStopped || startupState.twitterStopped,
+    ownedDataFiles: startupState.ownedDataFiles,
   });
   if (errors.length > 0) {
     context.write(
       `LOCAL_CONTROLLED cleanup failed: ${errors.map((error) => error.message).join("; ")}`,
     );
   }
+}
+
+async function restoreTwitterAfterUnreadableState(
+  context: ReturnType<typeof createContext>,
+  startupState: LocalStackState,
+  stateError: unknown,
+): Promise<void> {
+  const errors = [asError(stateError)];
+  if (startupState.twitterStopped) {
+    try {
+      await requireSuccess(
+        context.runner,
+        "docker",
+        ["start", LOCAL_CONTROLLED.twitterContainer],
+        { cwd: context.root },
+      );
+    } catch (error) {
+      errors.push(asError(error));
+    }
+  }
+  context.write(
+    `LOCAL_CONTROLLED cleanup incomplete: ${errors.map((error) => error.message).join("; ")}`,
+  );
 }
 
 async function teardown(
@@ -822,8 +1106,14 @@ async function assertGeneratedDataTargetsAvailable(
   await assertDestructivePaths(context);
   for (const file of generatedDataFiles) {
     try {
-      await lstat(ownedDataPath(context, file));
-      throw new Error(`LOCAL_CONTROLLED refuses to replace existing ${file}`);
+      const details = await lstat(ownedDataPath(context, file));
+      if (details.isSymbolicLink()) continue;
+      if (details.isFile()) {
+        throw new Error(
+          `LOCAL_CONTROLLED refuses to replace existing regular ${file}`,
+        );
+      }
+      throw new Error(`LOCAL_CONTROLLED refuses to replace invalid ${file}`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }

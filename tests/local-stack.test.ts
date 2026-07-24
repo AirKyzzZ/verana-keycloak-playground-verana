@@ -1,5 +1,6 @@
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -239,6 +240,8 @@ function dependencies(
         join(output, "local-controlled.env"),
         "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
       );
+      await writeFile(join(output, "broker-jwks.json"), "{}\n");
+      await writeFile(join(output, "realm.json"), "{}\n");
     },
     launch: async ({ startToken }) => {
       if (options.launchFails) throw new Error("host start failed");
@@ -269,6 +272,143 @@ afterEach(async () => {
 });
 
 describe("guarded local controlled stack lifecycle", () => {
+  it("restores Twitter but preserves unreadable state after its stopped-state write fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({ twitterRunning: true });
+    const output: string[] = [];
+    const deps = dependencies(runner, root, { launchFails: true, output });
+    const statePath = join(root, ".data", "local-stack-state.json");
+    let statePublications = 0;
+    deps.rename = async (source, destination) => {
+      if (destination === statePath && ++statePublications === 6) {
+        await rm(destination, { force: true });
+        await writeFile(destination, "not valid lifecycle state\n");
+        return;
+      }
+      await renamePath(source, destination);
+    };
+
+    await expect(up(deps)).rejects.toThrow("not valid JSON");
+
+    expect(runner.calls).toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
+    ]);
+    await expect(readFile(statePath, "utf8")).resolves.toBe(
+      "not valid lifecycle state\n",
+    );
+    expect(output.join("\n")).toContain("cleanup incomplete");
+  });
+
+  it("does not start Twitter when unreadable state was written before any stop", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({ twitterRunning: true });
+    const output: string[] = [];
+    const deps = dependencies(runner, root, { output });
+    const statePath = join(root, ".data", "local-stack-state.json");
+    let statePublications = 0;
+    deps.rename = async (source, destination) => {
+      if (destination === statePath && ++statePublications === 2) {
+        await rm(destination, { force: true });
+        await writeFile(destination, "not valid lifecycle state\n");
+        return;
+      }
+      await renamePath(source, destination);
+    };
+
+    await expect(up(deps)).rejects.toThrow("not valid JSON");
+
+    expect(runner.calls).not.toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
+    ]);
+    expect(output.join("\n")).toContain("cleanup incomplete");
+  });
+
+  it("replaces a state symlink without writing through it", async () => {
+    const root = await makeRoot();
+    const outside = await mkdtemp(join(tmpdir(), "outside-local-controlled-"));
+    roots.push(outside);
+    const runner = new FakeRunner({
+      twitterRunning: true,
+      failComposeDown: true,
+    });
+    const statePath = join(root, ".data", "local-stack-state.json");
+    const outsideState = join(outside, "state.json");
+    await writeFile(outsideState, "outside state must survive\n");
+    await symlink(outsideState, statePath);
+
+    await expect(
+      up(dependencies(runner, root, { launchFails: true })),
+    ).rejects.toThrow("host start failed");
+
+    await expect(readFile(outsideState, "utf8")).resolves.toBe(
+      "outside state must survive\n",
+    );
+    expect((await lstat(statePath)).isSymbolicLink()).toBe(false);
+    await expect(readFile(statePath, "utf8")).resolves.toContain(
+      "twitterStopped",
+    );
+  });
+
+  it("replaces a generated child symlink without writing through it", async () => {
+    const root = await makeRoot();
+    const outside = await mkdtemp(join(tmpdir(), "outside-local-controlled-"));
+    roots.push(outside);
+    const runner = new FakeRunner({ failComposeDown: true });
+    const deps = dependencies(runner, root, { launchFails: true });
+    const generatedEnvironment = join(root, ".data", ".env");
+    const outsideEnvironment = join(outside, "outside.env");
+    await writeFile(outsideEnvironment, "outside environment must survive\n");
+    deps.rename = async (source, destination) => {
+      if (destination === generatedEnvironment) {
+        await symlink(outsideEnvironment, generatedEnvironment);
+      }
+      await renamePath(source, destination);
+    };
+
+    await expect(up(deps)).rejects.toThrow("host start failed");
+
+    await expect(readFile(outsideEnvironment, "utf8")).resolves.toBe(
+      "outside environment must survive\n",
+    );
+    expect((await lstat(generatedEnvironment)).isSymbolicLink()).toBe(false);
+    await expect(readFile(generatedEnvironment, "utf8")).resolves.toContain(
+      "PAIRWISE_SUB_SECRET=",
+    );
+    await expect(
+      readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+    ).resolves.toContain("ownedDataFiles");
+  });
+
+  it("rejects a replaced generated-data staging directory before publishing it", async () => {
+    const root = await makeRoot();
+    const outside = await mkdtemp(join(tmpdir(), "outside-local-controlled-"));
+    roots.push(outside);
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    for (const file of [
+      ".env",
+      "local-controlled.env",
+      "broker-jwks.json",
+      "realm.json",
+    ]) {
+      await writeFile(join(outside, file), `${file} must survive\n`);
+      await chmod(join(outside, file), 0o644);
+    }
+    deps.generateData = async (output) => {
+      await rm(output, { recursive: true });
+      await symlink(outside, output);
+    };
+
+    await expect(up(deps)).rejects.toThrow("staging directory");
+
+    await expect(readFile(join(outside, ".env"), "utf8")).resolves.toBe(
+      ".env must survive\n",
+    );
+    expect((await stat(join(outside, ".env"))).mode & 0o777).toBe(0o644);
+  });
+
   it("stops only the expected Twitter container and records restoration state", async () => {
     const root = await makeRoot();
     const runner = new FakeRunner({
@@ -480,6 +620,8 @@ describe("guarded local controlled stack lifecycle", () => {
         join(output, "local-controlled.env"),
         "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
       );
+      await writeFile(join(output, "broker-jwks.json"), "{}\n");
+      await writeFile(join(output, "realm.json"), "{}\n");
     };
 
     await expect(up(deps)).rejects.toThrow("host environment override");
@@ -521,6 +663,11 @@ describe("guarded local controlled stack lifecycle", () => {
     const deps = dependencies(runner, root);
 
     await up(deps);
+    expect(
+      JSON.parse(
+        await readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+      ).ownedDataFiles,
+    ).toContain(".env");
     await rm(join(root, ".data", ".env"));
     await symlink(outside, join(root, ".data", ".env"));
     runner.setHostToken("verified-start-token");
@@ -582,7 +729,6 @@ describe("guarded local controlled stack lifecycle", () => {
     const lifecycleDirectory = join(root, ".data", "local-stack");
 
     await up(deps);
-    await mkdir(lifecycleDirectory);
     await writeFile(join(lifecycleDirectory, "host-process.log"), "owned log");
     runner.setHostToken("verified-start-token");
     deps.rename = async (source, destination) => {
@@ -631,6 +777,8 @@ describe("guarded local controlled stack lifecycle", () => {
         join(output, "local-controlled.env"),
         "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
       );
+      await writeFile(join(output, "broker-jwks.json"), "{}\n");
+      await writeFile(join(output, "realm.json"), "{}\n");
     };
 
     await expect(up(deps)).rejects.toThrow("host environment override");
@@ -675,7 +823,18 @@ describe("guarded local controlled stack lifecycle", () => {
     const root = await makeRoot();
     const runner = new FakeRunner();
     const statePath = join(root, ".data", "local-stack-state.json");
-    await writeFile(statePath, "{}\n");
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        composeProject: "verana-keycloak-local-controlled",
+        twitterWasRunning: false,
+        twitterStopped: false,
+        ownedDataFiles: [],
+        vsSourceCommit: "e2bba78746cb2c7ca7f43d28dc9641316f524d24",
+        startedAt: "2026-07-24T00:00:00.000Z",
+      }),
+    );
     await chmod(statePath, 0o644);
 
     await up(dependencies(runner, root));
