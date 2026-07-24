@@ -257,9 +257,30 @@ const getCookieHeader = (response: Response): string =>
     .map((value) => value.split(";", 1)[0])
     .join("; ");
 
+const fetchForIdentityProviderProbe = async (
+  input: string | URL | Request,
+  init: RequestInit,
+  overallDeadline: AbortSignal,
+  requestTimeoutMs: number,
+): Promise<Response> => {
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: AbortSignal.any([
+        overallDeadline,
+        AbortSignal.timeout(requestTimeoutMs),
+      ]),
+    });
+  } catch {
+    throw new Error("Identity-provider probe request failed");
+  }
+};
+
 const verifyIdentityProviderSecret = async (
   expectedSecret: string,
 ): Promise<void> => {
+  const overallDeadline = AbortSignal.timeout(10_000);
+  const requestTimeoutMs = 3_000;
   const { server, tokenRequest } = await startTokenProbe();
 
   try {
@@ -277,9 +298,12 @@ const verifyIdentityProviderSecret = async (
       state: randomBytes(32).toString("base64url"),
     }).toString();
 
-    const authorizationResponse = await fetch(authorizationUrl, {
-      redirect: "manual",
-    });
+    const authorizationResponse = await fetchForIdentityProviderProbe(
+      authorizationUrl,
+      { redirect: "manual" },
+      overallDeadline,
+      requestTimeoutMs,
+    );
     const brokerLoginLocation = authorizationResponse.headers.get("location");
     requireCondition(
       authorizationResponse.status === 303 && brokerLoginLocation,
@@ -288,12 +312,14 @@ const verifyIdentityProviderSecret = async (
     const cookies = getCookieHeader(authorizationResponse);
     requireCondition(cookies.length > 0, "Keycloak broker cookies are missing");
 
-    const brokerLoginResponse = await fetch(
+    const brokerLoginResponse = await fetchForIdentityProviderProbe(
       new URL(brokerLoginLocation, authorizationUrl),
       {
         headers: { cookie: cookies },
         redirect: "manual",
       },
+      overallDeadline,
+      requestTimeoutMs,
     );
     const externalAuthorizationLocation =
       brokerLoginResponse.headers.get("location");
@@ -317,10 +343,15 @@ const verifyIdentityProviderSecret = async (
     const callback = new URL(callbackUrl);
     callback.searchParams.set("code", "secret-verification-code");
     callback.searchParams.set("state", brokerState);
-    await fetch(callback, {
-      headers: { cookie: cookies },
-      redirect: "manual",
-    });
+    await fetchForIdentityProviderProbe(
+      callback,
+      {
+        headers: { cookie: cookies },
+        redirect: "manual",
+      },
+      overallDeadline,
+      requestTimeoutMs,
+    );
 
     const capturedRequest = await waitForTokenRequest(tokenRequest);
     assertClientSecretPost({

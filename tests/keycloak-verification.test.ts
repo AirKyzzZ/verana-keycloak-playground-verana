@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   assertClientSecretPost,
@@ -5,6 +8,8 @@ import {
   assertSecretMatch,
   parseLocalSecrets,
 } from "../scripts/keycloak-verification.js";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("Keycloak verification helpers", () => {
   it("rejects extra configured names with a static error", () => {
@@ -114,5 +119,37 @@ describe("Keycloak verification helpers", () => {
       "BROKER_CLIENT_SECRET",
       "PLAYGROUND_APP_CLIENT_SECRET",
     ]);
+  });
+
+  it("keeps generated setup secrets and private JWKs out of matchers", async () => {
+    const source = await readFile(join(root, "tests", "setup.test.ts"), "utf8");
+    const unsafeMatcherPatterns = [
+      /expect\(env\)/,
+      /expect\(jwks(?:\.keys\[[^\]]+\])?\)/,
+      /expect\(secrets\.[A-Z0-9_]+\)/,
+    ];
+
+    expect(unsafeMatcherPatterns.some((pattern) => pattern.test(source))).toBe(
+      false,
+    );
+    expect(
+      source.includes("finally") &&
+        source.includes("rm(output, { recursive: true, force: true })"),
+    ).toBe(true);
+  });
+
+  it("bounds all three identity-provider behavior probe fetches", async () => {
+    const source = await readFile(
+      join(root, "scripts", "verify-keycloak.ts"),
+      "utf8",
+    );
+
+    expect(
+      source.includes("const overallDeadline = AbortSignal.timeout("),
+    ).toBe(true);
+    expect(source.includes("AbortSignal.timeout(requestTimeoutMs)")).toBe(true);
+    expect(
+      source.match(/await fetchForIdentityProviderProbe\(/g)?.length ?? 0,
+    ).toBe(3);
   });
 });
