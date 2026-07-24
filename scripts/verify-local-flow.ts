@@ -59,6 +59,7 @@ interface Resolution {
   evidence: {
     authorized: boolean | null;
     did: string | null;
+    queries: string[];
     trustStatus: TrustStatus | null;
     vtjscId: string | null;
   };
@@ -129,6 +130,7 @@ interface PresentationIdentity {
   authorizationRequest: string;
   credentialId: string;
   credentialSubject: string;
+  gateId: string;
   issuerDid: string;
   issuanceSessionId: string;
   pairwiseSubject: string;
@@ -575,6 +577,9 @@ async function runTrustedPresentation(
       throw new Error("holder_denied");
     }
     const gateId = resolution.gateId;
+    if (previous && gateId === previous.gateId) {
+      throw new Error("presentation_gate_replay");
+    }
 
     await requestJson(
       `${normalizeBaseUrl(config.holderBaseUrl)}/oid4vc-demo/wallet/share`,
@@ -606,6 +611,7 @@ async function runTrustedPresentation(
       authorizationRequest: request.authorizationRequest,
       credentialId: credential.credentialId,
       credentialSubject: credential.subjectId,
+      gateId,
       issuerDid: identity.issuerDid,
       issuanceSessionId: credential.issuanceSessionId,
       pairwiseSubject: derivePairwiseSub({
@@ -635,12 +641,38 @@ async function assertRoguePresentationDenied(
       fetchImpl,
       resolutionSchema,
     );
-    if (resolution.verdict === "TRUSTED_AUTHORIZED") {
+    if (
+      config.evidenceMode === "LOCAL_CONTROLLED"
+        ? !isExactControlledRogueDenial(config, resolution)
+        : resolution.verdict === "TRUSTED_AUTHORIZED"
+    ) {
       throw new Error("rogue_not_denied");
     }
   } catch {
     throw new FlowFailure("FAIL_SMOKE");
   }
+}
+
+function isExactControlledRogueDenial(
+  config: LocalFlowConfig,
+  resolution: Resolution,
+): boolean {
+  const q1Query = `${normalizeBaseUrl(LOCAL_CONTROLLED.resolverUrl)}/resolve?did=${encodeURIComponent(LOCAL_CONTROLLED.rogueDid)}`;
+  return (
+    resolution.verdict === "UNTRUSTED" &&
+    resolution.evidence.did === LOCAL_CONTROLLED.rogueDid &&
+    resolution.evidence.trustStatus === "UNTRUSTED" &&
+    resolution.evidence.authorized === null &&
+    resolution.evidence.vtjscId === config.expectedVtjscId &&
+    exactStrings(resolution.evidence.queries, [q1Query]) &&
+    resolution.request.verifierDid === LOCAL_CONTROLLED.rogueDid &&
+    resolution.request.requestedVct === config.expectedVct &&
+    exactStrings(resolution.request.requestedClaims, [
+      "subject_id",
+      "organization",
+      "role",
+    ])
+  );
 }
 
 async function createPresentationRequest(
@@ -966,9 +998,13 @@ function parseEvidence(value: unknown): Resolution["evidence"] {
   const trustStatus = nullableTrustStatus(evidence.trustStatus);
   const authorized = nullableBoolean(evidence.authorized);
   const vtjscId = nullableBoundedString(evidence.vtjscId, MAX_URL_LENGTH);
-  boundedStringArray(evidence.queries, MAX_COLLECTION_ITEMS, MAX_URL_LENGTH);
+  const queries = boundedStringArray(
+    evidence.queries,
+    MAX_COLLECTION_ITEMS,
+    MAX_URL_LENGTH,
+  );
   if (evidence.note !== undefined) boundedString(evidence.note, 500);
-  return { authorized, did, trustStatus, vtjscId };
+  return { authorized, did, queries, trustStatus, vtjscId };
 }
 
 function parseShared(value: unknown): { shared: true; status: number } {

@@ -18,6 +18,8 @@ const VTJSC = "https://issuer.example/vt/badge.json";
 const SUBJECT = "call-demo-user";
 const CONTROLLED_SUBJECT = "local-controlled-user";
 const SENSITIVE_MARKER = "raw-secret-presentation-token";
+const ROGUE_Q1_QUERY =
+  "http://host.docker.internal:3099/v1/trust/resolve?did=did%3Aweb%3Arogue.localhost";
 
 interface FakeBehavior {
   capability?: {
@@ -41,6 +43,7 @@ interface FakeBehavior {
   mediaTypeAt?: "resolver" | "verifier";
   oversizedAt?: "resolver" | "verifier";
   invalidUtf8At?: "resolver" | "verifier";
+  replaySecondGate?: boolean;
   replaySecondRequest?: boolean;
   resolverUnavailable?: boolean;
   resolutionEvidenceDid?: string;
@@ -59,6 +62,14 @@ interface FakeBehavior {
   receiptVtjsc?: string;
   sessionNeverCompletes?: boolean;
   shareTimeout?: boolean;
+  rogueAuthorized?: boolean | null;
+  rogueEvidenceDid?: string | null;
+  rogueEvidenceTrustStatus?: string | null;
+  rogueEvidenceVtjsc?: string | null;
+  rogueQueries?: string[];
+  rogueRequestedClaims?: string[];
+  rogueRequestedVct?: string | null;
+  rogueRequestVerifierDid?: string | null;
   rogueVerdict?: string;
   trustedResolutionVerdict?: string;
   acceptedClaims?: {
@@ -92,7 +103,9 @@ interface FakeServices {
   fetch: typeof fetch;
   issues: () => number;
   keycloakReads: () => number;
+  keycloakUnexpectedRequests: () => number;
   requests: () => number;
+  shareGateIds: () => string[];
   shareAttempts: () => number;
   shares: () => number;
   trustedPresentations: () => number;
@@ -334,6 +347,7 @@ describe("local flow verification", () => {
     expect(services.shares()).toBe(2);
     expect(services.keycloakReads()).toBe(3);
     expect(services.brokerCalls()).toBe(0);
+    expect(services.keycloakUnexpectedRequests()).toBe(0);
     expect(services.walletAcceptBodies()).toEqual([
       { credentialOffer: "offer-1" },
       { credentialOffer: "offer-2" },
@@ -578,6 +592,18 @@ describe("local flow verification", () => {
     expect(services.brokerCalls()).toBe(0);
   });
 
+  it("rejects a replayed holder gate before sharing the stale gate twice", async () => {
+    const services = await startFakeServices({ replaySecondGate: true });
+    const { result } = await runControlledFlow(services);
+
+    expect(result).toBe(1);
+    expect(services.shareAttempts()).toBe(1);
+    expect(services.shares()).toBe(1);
+    expect(services.shareGateIds()).toEqual(["gate-1"]);
+    expect(services.brokerCalls()).toBe(0);
+    expect(services.keycloakUnexpectedRequests()).toBe(0);
+  });
+
   it("does not replay an uncertain share request", async () => {
     const services = await startFakeServices({ shareTimeout: true });
     const { result } = await runControlledFlow(services);
@@ -623,6 +649,7 @@ describe("local flow verification", () => {
 
       expect(result).toBe(1);
       expect(services.brokerCalls()).toBe(0);
+      expect(services.keycloakUnexpectedRequests()).toBe(0);
       expect(services.shares()).toBe(0);
       expect(services.keycloakReads()).toBe(2);
     },
@@ -639,6 +666,36 @@ describe("local flow verification", () => {
     expect(services.shares()).toBe(2);
     expect(services.keycloakReads()).toBe(3);
     expect(services.brokerCalls()).toBe(0);
+    expect(services.keycloakUnexpectedRequests()).toBe(0);
+  });
+
+  it.each([
+    [
+      "wrong request DID",
+      { rogueRequestVerifierDid: "did:web:wrong.localhost" },
+    ],
+    ["missing request DID", { rogueRequestVerifierDid: null }],
+    ["wrong evidence DID", { rogueEvidenceDid: "did:web:wrong.localhost" }],
+    ["missing evidence DID", { rogueEvidenceDid: null }],
+    ["TRUSTED evidence", { rogueEvidenceTrustStatus: "TRUSTED" }],
+    ["false authorization result", { rogueAuthorized: false }],
+    ["unexpected authorization", { rogueAuthorized: true }],
+    ["wrong VTJSC", { rogueEvidenceVtjsc: "https://wrong.example/vtjsc.json" }],
+    ["missing VTJSC", { rogueEvidenceVtjsc: null }],
+    ["wrong VCT", { rogueRequestedVct: "https://wrong.example/vct" }],
+    ["wrong claims", { rogueRequestedClaims: ["subject_id", "organization"] }],
+    ["non-Q1 resolver queries", { rogueQueries: [] }],
+    ["different denial verdict", { rogueVerdict: "TRUSTED_NOT_AUTHORIZED" }],
+  ])("rejects rogue denial with %s", async (_name, behavior) => {
+    const services = await startFakeServices(behavior);
+    const { lines, result } = await runControlledFlow(services);
+
+    expect(result).toBe(1);
+    expect(lines).not.toContain("VERDICT ROGUE DENIED");
+    expect(services.shareAttempts()).toBe(2);
+    expect(services.shares()).toBe(2);
+    expect(services.brokerCalls()).toBe(0);
+    expect(services.keycloakUnexpectedRequests()).toBe(0);
   });
 });
 
@@ -703,11 +760,13 @@ async function startFakeServices(
   let brokerCallCount = 0;
   let issueCount = 0;
   let keycloakReadCount = 0;
+  let keycloakUnexpectedRequestCount = 0;
   let requestCount = 0;
   let shareAttemptCount = 0;
   let shareCount = 0;
   let trustedRequestCount = 0;
   let trustedPresentationCount = 0;
+  const shareGateIds: string[] = [];
   const walletAcceptBodies: Record<string, unknown>[] = [];
   const capability = behavior.capability ?? {
     contractVersion: 1,
@@ -717,9 +776,6 @@ async function startFakeServices(
 
   const server = createServer(async (request, response) => {
     requestCount += 1;
-    if (request.url === "/broker/auth") {
-      brokerCallCount += 1;
-    }
     if (behavior.failWithSensitiveBody && request.url?.startsWith("/trust/")) {
       json(response, 200, {
         detail: SENSITIVE_MARKER,
@@ -729,6 +785,21 @@ async function startFakeServices(
     }
 
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (
+      url.pathname.startsWith("/broker") &&
+      !(
+        request.method === "GET" &&
+        url.pathname === "/broker/.well-known/openid-configuration"
+      )
+    ) {
+      brokerCallCount += 1;
+    }
+    if (
+      url.pathname.startsWith("/keycloak") &&
+      !isAllowedKeycloakRequest(request, url)
+    ) {
+      keycloakUnexpectedRequestCount += 1;
+    }
     const did = url.searchParams.get("did");
     const vtjscId = url.searchParams.get("vtjscId");
 
@@ -1035,42 +1106,76 @@ async function startFakeServices(
     ) {
       const body = await readJson(request);
       const rogue = body.authorizationRequest === "rogue-request";
+      const gateId =
+        !rogue && behavior.replaySecondGate && trustedRequestCount === 2
+          ? "gate-1"
+          : rogue
+            ? "gate-rogue"
+            : `gate-${trustedRequestCount}`;
+      const rogueEvidenceDid = hasOwn(behavior, "rogueEvidenceDid")
+        ? behavior.rogueEvidenceDid
+        : LOCAL_CONTROLLED.rogueDid;
+      const rogueRequestVerifierDid = hasOwn(
+        behavior,
+        "rogueRequestVerifierDid",
+      )
+        ? behavior.rogueRequestVerifierDid
+        : LOCAL_CONTROLLED.rogueDid;
+      const rogueAuthorized = hasOwn(behavior, "rogueAuthorized")
+        ? behavior.rogueAuthorized
+        : null;
+      const rogueEvidenceVtjsc = hasOwn(behavior, "rogueEvidenceVtjsc")
+        ? behavior.rogueEvidenceVtjsc
+        : LOCAL_CONTROLLED.vtjscId;
+      const rogueRequestedVct = hasOwn(behavior, "rogueRequestedVct")
+        ? behavior.rogueRequestedVct
+        : LOCAL_CONTROLLED.vct;
       json(response, 200, {
-        gateId: rogue ? "gate-rogue" : `gate-${trustedRequestCount}`,
+        gateId,
         verdict: rogue
-          ? (behavior.rogueVerdict ?? "TRUSTED_NOT_AUTHORIZED")
+          ? (behavior.rogueVerdict ?? "UNTRUSTED")
           : (behavior.trustedResolutionVerdict ?? "TRUSTED_AUTHORIZED"),
         evidence: {
           did: rogue
-            ? LOCAL_CONTROLLED.rogueDid
+            ? rogueEvidenceDid
             : (behavior.resolutionEvidenceDid ??
               (controlledRequest(request)
                 ? LOCAL_CONTROLLED.verifierDid
                 : VERIFIER_DID)),
-          trustStatus: "TRUSTED",
-          authorized: !rogue,
-          vtjscId:
-            behavior.resolutionEvidenceVtjsc ??
-            (controlledRequest(request) ? LOCAL_CONTROLLED.vtjscId : VTJSC),
-          queries: [],
+          trustStatus: rogue
+            ? (behavior.rogueEvidenceTrustStatus ?? "UNTRUSTED")
+            : "TRUSTED",
+          authorized: rogue ? rogueAuthorized : true,
+          vtjscId: rogue
+            ? rogueEvidenceVtjsc
+            : (behavior.resolutionEvidenceVtjsc ??
+              (controlledRequest(request) ? LOCAL_CONTROLLED.vtjscId : VTJSC)),
+          queries: rogue ? (behavior.rogueQueries ?? [ROGUE_Q1_QUERY]) : [],
         },
         request: {
           clientId: "x509_san_dns:verifier.example",
           clientIdPrefix: "x509_san_dns",
           verifierDid: rogue
-            ? LOCAL_CONTROLLED.rogueDid
+            ? rogueRequestVerifierDid
             : (behavior.resolutionVerifierDid ??
               (controlledRequest(request)
                 ? LOCAL_CONTROLLED.verifierDid
                 : VERIFIER_DID)),
-          requestedVct:
-            behavior.resolutionRequestedVct ??
-            (controlledRequest(request) ? LOCAL_CONTROLLED.vct : VCT),
-          requestedClaims: behavior.resolutionRequestedClaims ?? [
-            "subject_id",
-            "organization",
-            "role",
-          ],
+          requestedVct: rogue
+            ? rogueRequestedVct
+            : (behavior.resolutionRequestedVct ??
+              (controlledRequest(request) ? LOCAL_CONTROLLED.vct : VCT)),
+          requestedClaims: rogue
+            ? (behavior.rogueRequestedClaims ?? [
+                "subject_id",
+                "organization",
+                "role",
+              ])
+            : (behavior.resolutionRequestedClaims ?? [
+                "subject_id",
+                "organization",
+                "role",
+              ]),
         },
       });
       return;
@@ -1083,6 +1188,8 @@ async function startFakeServices(
       if (behavior.shareTimeout) {
         return;
       }
+      const body = await readJson(request);
+      if (typeof body.gateId === "string") shareGateIds.push(body.gateId);
       shareCount += 1;
       json(response, 200, { shared: true, status: 200 });
       return;
@@ -1174,7 +1281,9 @@ async function startFakeServices(
     fetch: fetchFixture,
     issues: () => issueCount,
     keycloakReads: () => keycloakReadCount,
+    keycloakUnexpectedRequests: () => keycloakUnexpectedRequestCount,
     requests: () => requestCount,
+    shareGateIds: () => shareGateIds,
     shareAttempts: () => shareAttemptCount,
     shares: () => shareCount,
     trustedPresentations: () => trustedPresentationCount,
@@ -1329,6 +1438,37 @@ function writeFaultResponse(
 
 function controlledRequest(request: IncomingMessage): boolean {
   return request.headers["x-fixture-controlled"] === "true";
+}
+
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.hasOwn(value, key);
+}
+
+function isAllowedKeycloakRequest(request: IncomingMessage, url: URL): boolean {
+  if (
+    request.method === "GET" &&
+    (url.pathname === "/keycloak/.well-known/openid-configuration" ||
+      url.pathname ===
+        "/keycloak/realms/verana-playground/.well-known/openid-configuration")
+  ) {
+    return true;
+  }
+  if (
+    request.method === "POST" &&
+    url.pathname === "/keycloak/realms/master/protocol/openid-connect/token"
+  ) {
+    return true;
+  }
+  return (
+    request.method === "GET" &&
+    (url.pathname === "/keycloak/admin/realms/verana-playground/users" ||
+      /^\/keycloak\/admin\/realms\/verana-playground\/users\/[^/]+\/groups$/.test(
+        url.pathname,
+      ) ||
+      /^\/keycloak\/admin\/realms\/verana-playground\/users\/[^/]+\/role-mappings\/realm\/composite$/.test(
+        url.pathname,
+      ))
+  );
 }
 
 function mapControlledUrl(
