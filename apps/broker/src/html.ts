@@ -1,8 +1,10 @@
+import type { EvidenceMode } from "./config.js";
 import type { LoginTransaction } from "./types.js";
 
 export type InteractionStatus = LoginTransaction["status"] | "expired";
 
 export interface InteractionPageInput {
+  evidenceMode: EvidenceMode;
   uid: string;
   authorizationRequest?: string;
   qrDataUrl?: string;
@@ -62,6 +64,7 @@ export function renderInteractionPage(input: InteractionPageInput): string {
   const errorCode = input.errorCode
     ? `<p class="error-code">Error: ${escapeHtml(input.errorCode)}</p>`
     : "";
+  const evidenceBoundary = renderEvidenceBoundary(input.evidenceMode);
   const requestControls =
     input.authorizationRequest && qrDataUrl
       ? `
@@ -93,11 +96,14 @@ export function renderInteractionPage(input: InteractionPageInput): string {
       textarea { box-sizing: border-box; width: 100%; min-height: 5rem; resize: vertical; border: 1px solid #334155; border-radius: .5rem; padding: .7rem; background: #090f1c; color: #cbd5e1; }
       button { width: 100%; margin-top: .75rem; border: 0; border-radius: .5rem; padding: .8rem 1rem; background: #38bdf8; color: #082f49; font-weight: 800; cursor: pointer; }
       .error-code { color: #fca5a5; font-family: ui-monospace, monospace; font-size: .8rem; }
+      .warning { margin: 0 0 1.25rem; padding: .9rem; border: 1px solid #a16207; border-radius: .65rem; color: #fde68a; line-height: 1.55; }
+      .warning strong { display: block; }
     </style>
   </head>
   <body>
     <main data-status="${escapeHtml(input.status)}" data-status-url="${statusUrl}" data-complete-url="${completeUrl}">
-      <div class="badges"><span class="badge">LOCAL DEMO</span><span class="badge">TESTNET</span></div>
+      <div class="badges"><span class="badge">LOCAL DEMO</span>${renderTestnetBadge(input.evidenceMode)}</div>
+      ${evidenceBoundary}
       <h1>Sign in with a Verana credential</h1>
       <p class="status" aria-live="polite"><strong id="status-label">${copy.label}</strong><span id="status-message">${copy.message}</span></p>
       ${errorCode}
@@ -146,4 +152,21 @@ export function renderInteractionPage(input: InteractionPageInput): string {
     </script>
   </body>
 </html>`;
+}
+
+function renderEvidenceBoundary(evidenceMode: EvidenceMode): string {
+  if (evidenceMode !== "LOCAL_CONTROLLED") return "";
+
+  const mode = escapeHtml(evidenceMode);
+  return `<aside class="warning" data-evidence-mode="${mode}">
+  <strong>${mode}</strong>
+  Real local OpenID4VC and Keycloak flow with a controlled local trust resolver.
+  This is not Verana testnet, trusted-HTTPS, physical-wallet, or production evidence.
+</aside>`;
+}
+
+function renderTestnetBadge(evidenceMode: EvidenceMode): string {
+  return evidenceMode === "LIVE_VERANA"
+    ? '<span class="badge">TESTNET</span>'
+    : "";
 }

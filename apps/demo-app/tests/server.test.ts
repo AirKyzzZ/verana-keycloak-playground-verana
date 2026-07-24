@@ -27,6 +27,7 @@ const config: DemoServerOptions["config"] = {
   VS_AGENT_ISSUER_BASE_URL: "http://localhost:3101",
   VS_AGENT_HOLDER_BASE_URL: "http://localhost:3102",
   VS_AGENT_VERIFIER_BASE_URL: "http://localhost:3201",
+  EVIDENCE_MODE: "LIVE_VERANA",
 };
 const APP_ORIGIN = new URL(config.DEMO_APP_REDIRECT_URI).origin;
 const servers: Server[] = [];
@@ -78,6 +79,7 @@ const positiveResolution: ResolvedPresentation = {
 
 function createOptions(
   identity: KeycloakIdentity = authorizedIdentity,
+  evidenceMode: DemoServerOptions["config"]["EVIDENCE_MODE"] = config.EVIDENCE_MODE,
 ): DemoServerOptions & {
   keycloakClient: DemoServerOptions["keycloakClient"] & {
     exchangeCallback: ReturnType<typeof vi.fn>;
@@ -103,7 +105,7 @@ function createOptions(
   );
 
   return {
-    config,
+    config: { ...config, EVIDENCE_MODE: evidenceMode },
     keycloakClient: {
       exchangeCallback,
       startAuthorization,
@@ -200,6 +202,35 @@ async function login(options = createOptions()): Promise<{
 }
 
 describe("OIDC application routes", () => {
+  it("labels every controlled-local page without rendering protocol secrets", async () => {
+    const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+    const home = await request(await startDemoServer(options))
+      .get("/")
+      .expect(200);
+    const wallet = await request(await startDemoServer(options))
+      .get("/wallet")
+      .expect(200);
+    const signedOut = await request(await startDemoServer(options))
+      .get("/profile")
+      .expect(401);
+    const error = await request(await startDemoServer(options))
+      .get("/callback")
+      .expect(400);
+    const { agent } = await login(options);
+    const profile = await agent.get("/profile").expect(200);
+
+    for (const response of [home, wallet, signedOut, error, profile]) {
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(response.text).toContain("LOCAL_CONTROLLED");
+      expect(response.text).toContain("controlled local trust resolver");
+      expect(response.text).toContain("not Verana testnet");
+      expect(response.text).not.toContain(
+        '><span class="badge">TESTNET</span>',
+      );
+      expect(response.text).not.toContain("raw-secret-presentation-token");
+    }
+  });
+
   it("uses same-origin referrer policy so Chrome preserves the exact Origin required by CSRF checks", async () => {
     const response = await request(await startDemoServer())
       .get("/")

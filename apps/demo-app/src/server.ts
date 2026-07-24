@@ -4,7 +4,7 @@ import Router from "@koa/router";
 import Koa, { type Context } from "koa";
 import bodyParser from "koa-bodyparser";
 
-import type { DemoConfig } from "./config.js";
+import type { DemoConfig, EvidenceMode } from "./config.js";
 import {
   renderErrorPage,
   renderHomePage,
@@ -91,7 +91,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
   );
 
   router.get("/", (context) => {
-    html(context, 200, renderHomePage());
+    html(context, 200, renderHomePage(config.EVIDENCE_MODE));
   });
 
   router.get("/login", async (context) => {
@@ -111,6 +111,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         400,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Invalid login callback",
           "Start a new Keycloak login.",
         ),
@@ -148,6 +149,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         401,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Login verification failed",
           "The Keycloak response could not be verified.",
         ),
@@ -162,7 +164,11 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       html(
         context,
         401,
-        renderErrorPage("Authentication required", "Sign in through Keycloak."),
+        renderErrorPage(
+          config.EVIDENCE_MODE,
+          "Authentication required",
+          "Sign in through Keycloak.",
+        ),
       );
       return;
     }
@@ -172,13 +178,18 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         403,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Identity is not authorized",
           "The exact ACME group, employee role, and Verana subject are required.",
         ),
       );
       return;
     }
-    html(context, 200, renderProfilePage(authorized, session.csrfToken));
+    html(
+      context,
+      200,
+      renderProfilePage(config.EVIDENCE_MODE, authorized, session.csrfToken),
+    );
   });
 
   router.post("/logout", (context) => {
@@ -196,6 +207,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         403,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Invalid logout request",
           "Reload the protected profile before trying again.",
         ),
@@ -213,11 +225,16 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       walletStore,
       secureCookies,
     );
-    html(context, 200, renderWalletPage(workflow));
+    html(context, 200, renderWalletPage(config.EVIDENCE_MODE, workflow));
   });
 
   router.post("/wallet/issue", async (context) => {
-    const access = requireWalletMutation(context, walletStore, expectedOrigin);
+    const access = requireWalletMutation(
+      context,
+      walletStore,
+      expectedOrigin,
+      config.EVIDENCE_MODE,
+    );
     if (!access) return;
     const subjectId = formString(context, "subjectId", 200);
     if (!subjectId) {
@@ -225,6 +242,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         400,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Invalid badge request",
           "An opaque subject of at most 200 characters is required.",
         ),
@@ -232,7 +250,11 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       return;
     }
     if (isOperationInProgress(access.workflow.workflowStatus)) {
-      renderWorkflowConflict(context, access.workflow.workflowStatus);
+      renderWorkflowConflict(
+        context,
+        config.EVIDENCE_MODE,
+        access.workflow.workflowStatus,
+      );
       return;
     }
     const operationId = randomOpaqueValue();
@@ -242,7 +264,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       workflowStatus: "issuing",
     };
     if (!walletStore.replace(access.token, pending)) {
-      renderExpiredWallet(context);
+      renderExpiredWallet(context, config.EVIDENCE_MODE);
       return;
     }
 
@@ -254,7 +276,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       if (
         !isCurrentOperation(walletStore, access.token, "issuing", operationId)
       ) {
-        renderSupersededWallet(context);
+        renderSupersededWallet(context, config.EVIDENCE_MODE);
         return;
       }
       const workflow: WalletWorkflow = {
@@ -263,7 +285,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         workflowStatus: "idle",
       };
       walletStore.replace(access.token, workflow);
-      html(context, 200, renderWalletPage(workflow));
+      html(context, 200, renderWalletPage(config.EVIDENCE_MODE, workflow));
     } catch {
       replaceCurrentOperation(
         walletStore,
@@ -275,12 +297,17 @@ export function createDemoServer(options: DemoServerOptions): Koa {
           workflowStatus: "issue_failed",
         },
       );
-      renderVsAgentUnavailable(context);
+      renderVsAgentUnavailable(context, config.EVIDENCE_MODE);
     }
   });
 
   router.post("/wallet/resolve", async (context) => {
-    const access = requireWalletMutation(context, walletStore, expectedOrigin);
+    const access = requireWalletMutation(
+      context,
+      walletStore,
+      expectedOrigin,
+      config.EVIDENCE_MODE,
+    );
     if (!access) return;
     const authorizationRequest = formString(
       context,
@@ -292,6 +319,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         400,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Invalid authorization request",
           "Paste a nonempty broker authorization request.",
         ),
@@ -302,7 +330,11 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       access.workflow.workflowStatus === "issuing" ||
       access.workflow.workflowStatus === "sharing"
     ) {
-      renderWorkflowConflict(context, access.workflow.workflowStatus);
+      renderWorkflowConflict(
+        context,
+        config.EVIDENCE_MODE,
+        access.workflow.workflowStatus,
+      );
       return;
     }
     const operationId = randomOpaqueValue();
@@ -315,7 +347,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       workflowStatus: "resolving",
     };
     if (!walletStore.replace(access.token, pending)) {
-      renderExpiredWallet(context);
+      renderExpiredWallet(context, config.EVIDENCE_MODE);
       return;
     }
 
@@ -325,7 +357,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       if (
         !isCurrentOperation(walletStore, access.token, "resolving", operationId)
       ) {
-        renderSupersededWallet(context);
+        renderSupersededWallet(context, config.EVIDENCE_MODE);
         return;
       }
       const workflow: WalletWorkflow = {
@@ -337,7 +369,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         workflowStatus: "resolved",
       };
       walletStore.replace(access.token, workflow);
-      html(context, 200, renderWalletPage(workflow));
+      html(context, 200, renderWalletPage(config.EVIDENCE_MODE, workflow));
     } catch {
       replaceCurrentOperation(
         walletStore,
@@ -352,18 +384,24 @@ export function createDemoServer(options: DemoServerOptions): Koa {
           workflowStatus: "resolve_failed",
         },
       );
-      renderVsAgentUnavailable(context);
+      renderVsAgentUnavailable(context, config.EVIDENCE_MODE);
     }
   });
 
   router.post("/wallet/share", async (context) => {
-    const access = requireWalletMutation(context, walletStore, expectedOrigin);
+    const access = requireWalletMutation(
+      context,
+      walletStore,
+      expectedOrigin,
+      config.EVIDENCE_MODE,
+    );
     if (!access) return;
     if (access.workflow.workflowStatus === "sharing") {
       html(
         context,
         409,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Sharing already in progress",
           "Wait for the local holder response before taking another action.",
         ),
@@ -375,6 +413,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         409,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Sharing outcome is uncertain",
           "Resolve and review a new request before any further sharing attempt.",
         ),
@@ -390,6 +429,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         409,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "No current reviewed request",
           "Resolve and review a new request before sharing.",
         ),
@@ -401,6 +441,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         403,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Sharing refused",
           "The verifier is not both trusted and authorized.",
         ),
@@ -417,7 +458,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       workflowStatus: "sharing",
     };
     if (!walletStore.replace(access.token, pending)) {
-      renderExpiredWallet(context);
+      renderExpiredWallet(context, config.EVIDENCE_MODE);
       return;
     }
 
@@ -426,7 +467,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       if (
         !isCurrentOperation(walletStore, access.token, "sharing", operationId)
       ) {
-        renderSupersededWallet(context);
+        renderSupersededWallet(context, config.EVIDENCE_MODE);
         return;
       }
       const updated: WalletWorkflow = {
@@ -439,7 +480,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         workflowStatus: "shared",
       };
       walletStore.replace(access.token, updated);
-      html(context, 200, renderWalletPage(updated));
+      html(context, 200, renderWalletPage(config.EVIDENCE_MODE, updated));
     } catch {
       replaceCurrentOperation(
         walletStore,
@@ -458,6 +499,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         context,
         502,
         renderErrorPage(
+          config.EVIDENCE_MODE,
           "Sharing outcome is uncertain",
           "The holder response was not verified. Resolve and review a new request before any further sharing attempt.",
         ),
@@ -574,6 +616,7 @@ function requireWalletMutation(
   context: Context,
   store: OpaqueStore<WalletWorkflow>,
   expectedOrigin: string,
+  evidenceMode: EvidenceMode,
 ): WalletAccess | undefined {
   const token = context.cookies.get(WALLET_COOKIE);
   const workflow = token ? store.get(token) : undefined;
@@ -589,6 +632,7 @@ function requireWalletMutation(
       context,
       403,
       renderErrorPage(
+        evidenceMode,
         "Invalid wallet request",
         "Reload the local holder page before trying again.",
       ),
@@ -607,33 +651,45 @@ function tokensEqual(expected: string, actual: string): boolean {
   );
 }
 
-function renderVsAgentUnavailable(context: Context): void {
+function renderVsAgentUnavailable(
+  context: Context,
+  evidenceMode: EvidenceMode,
+): void {
   html(
     context,
     502,
     renderErrorPage(
+      evidenceMode,
       "Local VS Agent unavailable",
       "The bounded local request failed. Try again after checking the role-specific services.",
     ),
   );
 }
 
-function renderExpiredWallet(context: Context): void {
+function renderExpiredWallet(
+  context: Context,
+  evidenceMode: EvidenceMode,
+): void {
   html(
     context,
     409,
     renderErrorPage(
+      evidenceMode,
       "Local holder session expired",
       "Reload the local holder page before trying again.",
     ),
   );
 }
 
-function renderSupersededWallet(context: Context): void {
+function renderSupersededWallet(
+  context: Context,
+  evidenceMode: EvidenceMode,
+): void {
   html(
     context,
     409,
     renderErrorPage(
+      evidenceMode,
       "Wallet workflow changed",
       "Reload the local holder page to review the current state.",
     ),
@@ -642,6 +698,7 @@ function renderSupersededWallet(context: Context): void {
 
 function renderWorkflowConflict(
   context: Context,
+  evidenceMode: EvidenceMode,
   status: WalletWorkflow["workflowStatus"],
 ): void {
   const action =
@@ -654,6 +711,7 @@ function renderWorkflowConflict(
     context,
     409,
     renderErrorPage(
+      evidenceMode,
       `${action} already in progress`,
       "Wait for the current operation before taking another action.",
     ),

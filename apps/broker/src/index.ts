@@ -36,6 +36,7 @@ export async function createBrokerApplication(
   });
 
   return attachInteractionRoutes(provider, {
+    evidenceMode: config.EVIDENCE_MODE,
     loginService,
     transactionStore,
   });

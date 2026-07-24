@@ -28,6 +28,7 @@ const config: BrokerConfig = {
   SECTOR_IDENTIFIER: "verana-playground",
   PAIRWISE_SUB_SECRET: "pairwise-sub-secret-at-least-32-bytes",
   BROKER_JWKS_PATH: ".data/broker-jwks.json",
+  EVIDENCE_MODE: "LIVE_VERANA",
 };
 
 const authorizationRequest = `openid4vp://authorize?<script>&"'</script>`;
@@ -127,6 +128,7 @@ async function beginInteractionWithCookies(
 function createHarness(
   now: () => number = () => 1_000,
   startGate?: Promise<void>,
+  evidenceMode: BrokerConfig["EVIDENCE_MODE"] = config.EVIDENCE_MODE,
 ): {
   agent: SuperAgentTest;
   loginService: FakeLoginService;
@@ -141,6 +143,7 @@ function createHarness(
     privateJwks,
   });
   attachInteractionRoutes(provider, {
+    evidenceMode,
     loginService,
     transactionStore: transactions,
   });
@@ -154,6 +157,31 @@ function createHarness(
 }
 
 describe("wallet interaction server", () => {
+  it("labels initial, pending, and denied controlled-local pages without rendering the presentation request", async () => {
+    const { agent, loginService } = createHarness(
+      () => 1_000,
+      undefined,
+      "LOCAL_CONTROLLED",
+    );
+    const { path, uid } = await beginInteraction(agent);
+
+    const initial = await agent.get(path).expect(200);
+    const pending = await agent.get(path).expect(200);
+    loginService.states.set(uid, { status: "denied" });
+    const denied = await agent.get(path).expect(200);
+
+    for (const response of [initial, pending, denied]) {
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(response.text).toContain("LOCAL_CONTROLLED");
+      expect(response.text).toContain("controlled local trust resolver");
+      expect(response.text).toContain("not Verana testnet");
+      expect(response.text).not.toContain(
+        '><span class="badge">TESTNET</span>',
+      );
+      expect(response.text).not.toContain("raw-secret-presentation-token");
+    }
+  });
+
   it("creates one verifier request and reuses it on refresh", async () => {
     const { agent, loginService } = createHarness();
     const { path } = await beginInteraction(agent);

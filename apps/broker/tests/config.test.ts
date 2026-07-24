@@ -15,6 +15,21 @@ const requiredEnvironment = {
 };
 
 describe("broker generated-data paths", () => {
+  it("accepts only explicit evidence modes", () => {
+    expect(
+      loadBrokerConfig({
+        ...requiredEnvironment,
+        EVIDENCE_MODE: "LOCAL_CONTROLLED",
+      }).EVIDENCE_MODE,
+    ).toBe("LOCAL_CONTROLLED");
+    expect(() =>
+      loadBrokerConfig({
+        ...requiredEnvironment,
+        EVIDENCE_MODE: "local",
+      }),
+    ).toThrow();
+  });
+
   it("resolves a relative JWKS path from the repository root when cwd is the broker package", () => {
     const previousCwd = process.cwd();
     process.chdir(join(repositoryRoot, "apps", "broker"));

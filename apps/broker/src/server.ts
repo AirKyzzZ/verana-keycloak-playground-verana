@@ -1,6 +1,7 @@
 import type Provider from "oidc-provider";
 import QRCode from "qrcode";
 
+import type { EvidenceMode } from "./config.js";
 import { type InteractionStatus, renderInteractionPage } from "./html.js";
 import type { LoginService } from "./login-service.js";
 import type { TransactionStore } from "./transaction-store.js";
@@ -9,6 +10,7 @@ import type { LoginTransaction } from "./types.js";
 type LoginServiceContract = Pick<LoginService, "start" | "poll">;
 
 export interface InteractionRouteOptions {
+  evidenceMode: EvidenceMode;
   loginService: LoginServiceContract;
   transactionStore: TransactionStore;
 }
@@ -29,7 +31,7 @@ function publicStatus(
 
 export function attachInteractionRoutes(
   provider: Provider,
-  { loginService, transactionStore }: InteractionRouteOptions,
+  { evidenceMode, loginService, transactionStore }: InteractionRouteOptions,
 ): Provider {
   const startedInteractions = new Set<string>();
   const failedStarts = new Set<string>();
@@ -185,6 +187,7 @@ export function attachInteractionRoutes(
 
     context.type = "text/html";
     context.body = renderInteractionPage({
+      evidenceMode,
       uid,
       status: status.status,
       ...(transaction

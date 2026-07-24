@@ -8,6 +8,12 @@ loadDotenv({ path: ".data/.env", override: false, quiet: true });
 
 const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
 
+export const evidenceModeSchema = z
+  .enum(["LIVE_VERANA", "LOCAL_CONTROLLED"])
+  .default("LIVE_VERANA");
+
+export type EvidenceMode = z.infer<typeof evidenceModeSchema>;
+
 export const brokerConfigSchema = z.object({
   BROKER_ISSUER: z.string().url().default("http://localhost:3001"),
   BROKER_PORT: z.coerce.number().int().min(1).max(65535).default(3001),
@@ -26,6 +32,7 @@ export const brokerConfigSchema = z.object({
   SECTOR_IDENTIFIER: z.string().default("verana-playground"),
   PAIRWISE_SUB_SECRET: z.string().min(32),
   BROKER_JWKS_PATH: z.string().default(".data/broker-jwks.json"),
+  EVIDENCE_MODE: evidenceModeSchema,
 });
 
 export type BrokerConfig = z.infer<typeof brokerConfigSchema>;

@@ -1,3 +1,4 @@
+import type { EvidenceMode } from "./config.js";
 import type { KeycloakIdentity } from "./keycloak-client.js";
 import type {
   AcceptedBadge,
@@ -36,13 +37,14 @@ export function escapeHtml(value: string): string {
   );
 }
 
-export function renderHomePage(): string {
+export function renderHomePage(evidenceMode: EvidenceMode): string {
   return renderDocument(
     "Verana Keycloak playground",
     `
+      ${renderEvidenceBoundary(evidenceMode)}
       <div class="badges">
         <span class="badge">LOCAL DEMO</span>
-        <span class="badge">TESTNET</span>
+        ${renderTestnetBadge(evidenceMode)}
       </div>
       <h1>Verana credential sign in</h1>
       <p>Use Keycloak Authorization Code with PKCE to reach the protected profile.</p>
@@ -55,15 +57,17 @@ export function renderHomePage(): string {
 }
 
 export function renderProfilePage(
+  evidenceMode: EvidenceMode,
   identity: KeycloakIdentity & { veranaSubject: string },
   csrfToken: string,
 ): string {
   return renderDocument(
     "Protected profile",
     `
+      ${renderEvidenceBoundary(evidenceMode)}
       <div class="badges">
         <span class="badge">KEYCLOAK VERIFIED</span>
-        <span class="badge">TESTNET</span>
+        ${renderTestnetBadge(evidenceMode)}
       </div>
       <h1>Protected identity</h1>
       <dl>
@@ -82,7 +86,10 @@ export function renderProfilePage(
   );
 }
 
-export function renderWalletPage(state: WalletPageState): string {
+export function renderWalletPage(
+  evidenceMode: EvidenceMode,
+  state: WalletPageState,
+): string {
   const csrfField = `<input type="hidden" name="csrfToken" value="${escapeHtml(state.csrfToken)}">`;
   const credential = state.acceptedBadge
     ? `
@@ -114,9 +121,10 @@ export function renderWalletPage(state: WalletPageState): string {
   return renderDocument(
     "Local holder",
     `
+      ${renderEvidenceBoundary(evidenceMode)}
       <div class="badges">
         <span class="badge">LOCAL HOLDER</span>
-        <span class="badge">TESTNET</span>
+        ${renderTestnetBadge(evidenceMode)}
       </div>
       <h1>Local holder workflow</h1>
       <p class="warning">This is local integration evidence, not physical-wallet evidence.</p>
@@ -148,10 +156,15 @@ export function renderWalletPage(state: WalletPageState): string {
   );
 }
 
-export function renderErrorPage(title: string, message: string): string {
+export function renderErrorPage(
+  evidenceMode: EvidenceMode,
+  title: string,
+  message: string,
+): string {
   return renderDocument(
     title,
     `
+      ${renderEvidenceBoundary(evidenceMode)}
       <h1>${escapeHtml(title)}</h1>
       <p class="error">${escapeHtml(message)}</p>
       <p><a href="/">Return to the playground</a></p>
@@ -251,6 +264,8 @@ function renderDocument(title: string, content: string): string {
       .result { margin-top: 1.5rem; padding: 1rem; border: 1px solid #334155; border-radius: .65rem; background: #0b1220; }
       .success { color: #86efac; }
       .warning { color: #fde68a; }
+      aside.warning { padding: .9rem; border: 1px solid #a16207; border-radius: .65rem; }
+      aside.warning strong { display: block; }
       .error { color: #fca5a5; }
       a { color: #7dd3fc; }
     </style>
@@ -259,4 +274,21 @@ function renderDocument(title: string, content: string): string {
     <main>${content}</main>
   </body>
 </html>`;
+}
+
+function renderEvidenceBoundary(evidenceMode: EvidenceMode): string {
+  if (evidenceMode !== "LOCAL_CONTROLLED") return "";
+
+  const mode = escapeHtml(evidenceMode);
+  return `<aside class="warning" data-evidence-mode="${mode}">
+  <strong>${mode}</strong>
+  Real local OpenID4VC and Keycloak flow with a controlled local trust resolver.
+  This is not Verana testnet, trusted-HTTPS, physical-wallet, or production evidence.
+</aside>`;
+}
+
+function renderTestnetBadge(evidenceMode: EvidenceMode): string {
+  return evidenceMode === "LIVE_VERANA"
+    ? '<span class="badge">TESTNET</span>'
+    : "";
 }

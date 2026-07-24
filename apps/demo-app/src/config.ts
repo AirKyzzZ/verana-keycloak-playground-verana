@@ -3,6 +3,12 @@ import { z } from "zod";
 
 loadDotenv({ path: ".data/.env", override: false, quiet: true });
 
+export const evidenceModeSchema = z
+  .enum(["LIVE_VERANA", "LOCAL_CONTROLLED"])
+  .default("LIVE_VERANA");
+
+export type EvidenceMode = z.infer<typeof evidenceModeSchema>;
+
 export const demoConfigSchema = z.object({
   DEMO_APP_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   PLAYGROUND_APP_CLIENT_SECRET: z.string().min(32),
@@ -19,6 +25,7 @@ export const demoConfigSchema = z.object({
   VS_AGENT_ISSUER_BASE_URL: z.string().url().default("http://localhost:3101"),
   VS_AGENT_HOLDER_BASE_URL: z.string().url().default("http://localhost:3101"),
   VS_AGENT_VERIFIER_BASE_URL: z.string().url().default("http://localhost:3201"),
+  EVIDENCE_MODE: evidenceModeSchema,
 });
 
 export type DemoConfig = z.infer<typeof demoConfigSchema>;
