@@ -1,0 +1,163 @@
+{
+  "realm": "verana-playground",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "employee"
+      }
+    ]
+  },
+  "groups": [
+    {
+      "name": "organizations",
+      "subGroups": [
+        {
+          "name": "acme"
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "playground-app",
+      "secret": "__PLAYGROUND_APP_CLIENT_SECRET__",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://localhost:3000/callback"],
+      "webOrigins": ["http://localhost:3000"],
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "verana subject",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "verana_subject",
+            "claim.name": "verana_subject",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "multivalued": "false"
+          }
+        },
+        {
+          "name": "organization groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "full.path": "true",
+            "claim.name": "groups",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "identityProviders": [
+    {
+      "alias": "verana-wallet",
+      "displayName": "Verana Wallet",
+      "providerId": "oidc",
+      "enabled": true,
+      "trustEmail": false,
+      "storeToken": false,
+      "firstBrokerLoginFlowAlias": "verana first broker login",
+      "config": {
+        "authorizationUrl": "http://localhost:3001/auth",
+        "tokenUrl": "http://host.docker.internal:3001/token",
+        "jwksUrl": "http://host.docker.internal:3001/jwks",
+        "issuer": "http://localhost:3001",
+        "clientId": "keycloak-playground",
+        "clientSecret": "__BROKER_CLIENT_SECRET__",
+        "clientAuthMethod": "client_secret_post",
+        "defaultScope": "openid",
+        "useJwksUrl": "true",
+        "validateSignature": "true",
+        "pkceEnabled": "true",
+        "pkceMethod": "S256",
+        "syncMode": "FORCE"
+      }
+    }
+  ],
+  "authenticationFlows": [
+    {
+      "alias": "verana first broker login",
+      "description": "JIT create verified Verana users",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "idp-create-user-if-unique",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "userSetupAllowed": false
+        }
+      ]
+    }
+  ],
+  "identityProviderMappers": [
+    {
+      "name": "ACME organization group",
+      "identityProviderAlias": "verana-wallet",
+      "identityProviderMapper": "oidc-advanced-group-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "claims": "[{\"key\":\"organization\",\"value\":\"ACME\"}]",
+        "are.claim.values.regex": "false",
+        "group": "/organizations/acme"
+      }
+    },
+    {
+      "name": "Employee role",
+      "identityProviderAlias": "verana-wallet",
+      "identityProviderMapper": "oidc-role-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "claim": "role",
+        "claim.value": "employee",
+        "role": "employee"
+      }
+    },
+    {
+      "name": "Verana pairwise subject",
+      "identityProviderAlias": "verana-wallet",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "claim": "sub",
+        "user.attribute": "verana_subject",
+        "allow.nullable.property": "false"
+      }
+    }
+  ]
+}
