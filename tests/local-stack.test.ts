@@ -41,8 +41,15 @@ interface FakeBehavior {
   failTwitterStart?: boolean;
   failTwitterStop?: boolean;
   failComposeBuild?: boolean;
-  composeResources?: string;
-  composeVolumes?: string;
+  containers?: readonly {
+    id: string;
+    project: string;
+    running: boolean;
+  }[];
+  volumes?: readonly {
+    name: string;
+    project: string;
+  }[];
 }
 
 class FakeRunner implements CommandRunner {
@@ -59,7 +66,6 @@ class FakeRunner implements CommandRunner {
   > &
     FakeBehavior;
   private stackRunning = false;
-  private requireComposeEnvFile = false;
 
   constructor(behavior: FakeBehavior = {}) {
     this.behavior = {
@@ -84,12 +90,7 @@ class FakeRunner implements CommandRunner {
     this.onRun?.(command, args);
     this.options.push({ command, args, ...(options ? { options } : {}) });
     const envFileIndex = args.indexOf("--env-file");
-    if (
-      this.requireComposeEnvFile &&
-      command === "docker" &&
-      args[0] === "compose" &&
-      envFileIndex >= 0
-    ) {
+    if (command === "docker" && args[0] === "compose" && envFileIndex >= 0) {
       const envFile = args[envFileIndex + 1];
       if (!envFile) {
         return {
@@ -149,6 +150,20 @@ class FakeRunner implements CommandRunner {
       const owner = this.ownerFor(port);
       return { exitCode: 0, stdout: owner ? `${owner}\n` : "", stderr: "" };
     }
+    if (command === "docker" && args[0] === "container" && args[1] === "ls") {
+      const project = this.composeProjectFilter(args);
+      const includeStopped = args.includes("--all");
+      const containers = (this.behavior.containers ?? []).filter(
+        (container) =>
+          (project === undefined || container.project === project) &&
+          (includeStopped || container.running),
+      );
+      return {
+        exitCode: 0,
+        stdout: containers.map((container) => container.id).join("\n"),
+        stderr: "",
+      };
+    }
     if (
       command === "docker" &&
       args[0] === "container" &&
@@ -168,16 +183,15 @@ class FakeRunner implements CommandRunner {
       };
     }
     if (command === "docker" && args[0] === "volume") {
+      const project = this.composeProjectFilter(args);
       return {
         exitCode: 0,
-        stdout: this.behavior.composeVolumes ?? "",
-        stderr: "",
-      };
-    }
-    if (command === "docker" && args[0] === "compose" && args.includes("ps")) {
-      return {
-        exitCode: 0,
-        stdout: this.behavior.composeResources ?? "[]\n",
+        stdout: (this.behavior.volumes ?? [])
+          .filter(
+            (volume) => project === undefined || volume.project === project,
+          )
+          .map((volume) => volume.name)
+          .join("\n"),
         stderr: "",
       };
     }
@@ -228,16 +242,19 @@ class FakeRunner implements CommandRunner {
     );
   }
 
-  requireExistingComposeEnvFiles(): void {
-    this.requireComposeEnvFile = true;
-  }
-
   setHostToken(token: string): void {
     this.behavior.hostToken = token;
   }
 
   keycloakUserCount(): number {
     return this.behavior.keycloakUsers ?? 0;
+  }
+
+  private composeProjectFilter(args: readonly string[]): string | undefined {
+    const filterIndex = args.indexOf("--filter");
+    if (filterIndex < 0) return undefined;
+    const filter = args[filterIndex + 1];
+    return filter?.replace(/^label=com\.docker\.compose\.project=/, "");
   }
 
   private ownerFor(port: number): string | undefined {
@@ -487,7 +504,6 @@ describe("guarded local controlled stack lifecycle", () => {
     let statePublications = 0;
     deps.rename = async (source, destination) => {
       if (destination === statePath && ++statePublications === 2) {
-        runner.requireExistingComposeEnvFiles();
         throw new Error("ownership state publication failed");
       }
       await renamePath(source, destination);
@@ -512,11 +528,6 @@ describe("guarded local controlled stack lifecycle", () => {
     const root = await makeRoot();
     const runner = new FakeRunner({ failComposeBuild: true });
     const deps = dependencies(runner, root);
-    runner.onRun = (command, args) => {
-      if (command === "docker" && args.includes("build")) {
-        runner.requireExistingComposeEnvFiles();
-      }
-    };
 
     await expect(up(deps)).rejects.toThrow("docker compose");
 
@@ -938,11 +949,57 @@ describe("guarded local controlled stack lifecycle", () => {
     await expect(up(deps)).rejects.toThrow("host environment override");
   });
 
-  it("rejects stopped exact-project Compose resources before build", async () => {
+  it("runs fresh preflight without generated Compose config", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+
+    await expect(preflight(dependencies(runner, root))).resolves.toEqual({
+      twitterWasRunning: false,
+      vsSourceCommit: "e2bba78746cb2c7ca7f43d28dc9641316f524d24",
+    });
+
+    await expect(
+      lstat(join(root, ".data", "local-controlled.env")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runner.calls).toContainEqual([
+      "docker",
+      [
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        "label=com.docker.compose.project=verana-keycloak-local-controlled",
+        "--format",
+        "{{.ID}}",
+      ],
+    ]);
+    expect(runner.calls).toContainEqual([
+      "docker",
+      [
+        "volume",
+        "ls",
+        "--filter",
+        "label=com.docker.compose.project=verana-keycloak-local-controlled",
+        "--format",
+        "{{.Name}}",
+      ],
+    ]);
+    expect(runner.composeCalls()).toEqual([["docker", ["compose", "version"]]]);
+    expect(runner.calls.flatMap(([, args]) => args)).not.toContain(
+      ".data/local-controlled.env",
+    );
+  });
+
+  it("rejects a stopped exact-project container before build", async () => {
     const root = await makeRoot();
     const runner = new FakeRunner({
-      composeResources:
-        '[{"Name":"verana-keycloak-local-controlled-keycloak-1","State":"exited"}]\n',
+      containers: [
+        {
+          id: "stopped-keycloak-container",
+          project: "verana-keycloak-local-controlled",
+          running: false,
+        },
+      ],
     });
 
     await expect(up(dependencies(runner, root))).rejects.toThrow(
@@ -954,13 +1011,42 @@ describe("guarded local controlled stack lifecycle", () => {
   it("rejects exact-project leftover volumes before build", async () => {
     const root = await makeRoot();
     const runner = new FakeRunner({
-      composeVolumes: "verana-keycloak-local-controlled_issuer-afj\n",
+      volumes: [
+        {
+          name: "verana-keycloak-local-controlled_issuer-afj",
+          project: "verana-keycloak-local-controlled",
+        },
+      ],
     });
 
     await expect(up(dependencies(runner, root))).rejects.toThrow(
       "leftover volume",
     );
     expect(runner.composeUpCalls()).toHaveLength(0);
+  });
+
+  it("ignores containers and volumes from another Compose project", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      containers: [
+        {
+          id: "other-project-container",
+          project: "other-project",
+          running: false,
+        },
+      ],
+      volumes: [
+        {
+          name: "other-project-data",
+          project: "other-project",
+        },
+      ],
+    });
+
+    await expect(preflight(dependencies(runner, root))).resolves.toEqual({
+      twitterWasRunning: false,
+      vsSourceCommit: "e2bba78746cb2c7ca7f43d28dc9641316f524d24",
+    });
   });
 
   it("fails closed when Docker runtime capacity cannot be determined", async () => {

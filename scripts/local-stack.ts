@@ -573,9 +573,22 @@ async function dockerPortOwner(
 async function assertNoAmbiguousComposeState(
   context: ReturnType<typeof createContext>,
 ): Promise<void> {
-  const result = await runCompose(context, ["ps", "--all", "--format", "json"]);
-  const output = result.stdout.trim();
-  if (output && output !== "[]") {
+  const projectLabel = `label=com.docker.compose.project=${LOCAL_CONTROLLED.composeProject}`;
+  const containers = await requireSuccess(
+    context.runner,
+    "docker",
+    [
+      "container",
+      "ls",
+      "--all",
+      "--filter",
+      projectLabel,
+      "--format",
+      "{{.ID}}",
+    ],
+    { cwd: context.root },
+  );
+  if (containers.stdout.trim()) {
     throw new Error(
       "LOCAL_CONTROLLED Compose project is already in a partial state",
     );
@@ -583,14 +596,7 @@ async function assertNoAmbiguousComposeState(
   const volumes = await requireSuccess(
     context.runner,
     "docker",
-    [
-      "volume",
-      "ls",
-      "--filter",
-      `label=com.docker.compose.project=${LOCAL_CONTROLLED.composeProject}`,
-      "--format",
-      "{{.Name}}",
-    ],
+    ["volume", "ls", "--filter", projectLabel, "--format", "{{.Name}}"],
     { cwd: context.root },
   );
   if (volumes.stdout.trim()) {
