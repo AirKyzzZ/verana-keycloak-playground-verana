@@ -137,6 +137,20 @@ describe("LoginService", () => {
     expect(accounts.saved.size).toBe(0);
   });
 
+  it("denies a rogue verifier tenant without creating an account", async () => {
+    const denied = structuredClone(positiveSession);
+    denied.receipt.exchange.tenant = "rogue";
+    const { accounts, service } = createService(async () => denied);
+    await service.start("tx-1");
+
+    await expect(service.poll("tx-1")).resolves.toMatchObject({
+      uid: "tx-1",
+      status: "denied",
+      errorCode: "tenant_not_allowed",
+    });
+    expect(accounts.saved.size).toBe(0);
+  });
+
   it("marks an unavailable verifier session without creating an account", async () => {
     const { accounts, service } = createService(async () => {
       throw new Error("vs_agent_unavailable");

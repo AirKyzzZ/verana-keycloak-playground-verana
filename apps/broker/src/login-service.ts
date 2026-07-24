@@ -33,6 +33,7 @@ const denialCodes = new Set([
   "session_mismatch",
   "vct_mismatch",
   "schema_mismatch",
+  "tenant_not_allowed",
   "verifier_not_authorized",
   "issuer_not_authorized",
   "organization_not_allowed",

@@ -89,6 +89,10 @@ export function authorizeReceipt(
     throw new Error("schema_mismatch");
   }
 
+  if (verifiedReceipt.exchange.tenant !== "trusted") {
+    throw new Error("tenant_not_allowed");
+  }
+
   if (verifiedReceipt.verifier.verdict !== "TRUSTED_AUTHORIZED") {
     throw new Error("verifier_not_authorized");
   }

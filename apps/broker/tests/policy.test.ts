@@ -42,6 +42,20 @@ describe("authorizeReceipt", () => {
     );
   });
 
+  it("denies a rogue verifier tenant", () => {
+    const receipt = structuredClone(positiveSession);
+    receipt.receipt.exchange.tenant = "rogue";
+
+    expect(authorizationError(receipt)).toBe("tenant_not_allowed");
+  });
+
+  it("rejects a tenant outside the upstream union as malformed", () => {
+    const receipt = structuredClone(positiveSession);
+    Object.assign(receipt.receipt.exchange, { tenant: "unexpected" });
+
+    expect(authorizationError(receipt)).toBe("invalid_receipt");
+  });
+
   it.each([
     "PARTIAL",
     "TRUSTED_NOT_AUTHORIZED",
