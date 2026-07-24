@@ -3,10 +3,12 @@
 ## Run boundary
 
 - Date: 2026-07-24, Europe/Paris (CEST, UTC+02:00).
-- Playground implementation tested: `c8c9f6b`.
+- Playground automated implementation tested: `e4233fa`.
+- Browser boundary snapshot: `a736ef5`; the later security fixes were verified
+  by focused and full automated checks, not promoted to new browser evidence.
 - Runtime: Node.js 24.14.0 and pnpm 10.28.1.
-- VS Agent subject-capability commit:
-  `d778012` (independently reviewed with no findings).
+- VS Agent subject/trust integration tested: `ec078f1` (includes the
+  subject-capability work at `d778012`).
 - Network: Verana testnet resolver at
   `https://resolver.testnet.verana.network/v1/trust`.
 - VCT:
@@ -28,7 +30,8 @@ acceptance. No fixture result is promoted to live evidence.
 | `docker compose up -d keycloak` | 0 | Recreated pinned Keycloak 26.7.0 from the fresh realm state. |
 | `docker compose ps` | 0 | `auth-demo-keycloak-1` reported healthy. |
 | `docker compose config` | 0 | Rendered one loopback-bound Keycloak 26.7.0 service with the generated realm mounted read-only. |
-| `pnpm check` | 0 | Biome checked 50 files; both workspaces typechecked and built; 169 tests passed in 16 files. |
+| `pnpm check` | 0 | Biome checked 50 files; both workspaces typechecked and built; 172 tests passed in 16 files. |
+| VS Agent OpenID4VC plugin test and build | 0 | 72 tests passed in 10 files, including exact Q1 DID/production and Q2/Q3 DID/VTJSC response binding for issuer and verifier; the package rebuilt successfully. |
 | `pnpm exec tsc --noEmit --target ES2024 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck scripts/verify-local-flow.ts tests/local-flow-verification.test.ts` | 0 | Standalone script and focused test TypeScript check passed. |
 | `pnpm tsx scripts/verify-keycloak.ts` | 0 | Realm, Authorization Code with S256, IdP, broker signature/secret behavior, JIT-only first login, exact mappers, authorization targets, and zero pre-created users passed. |
 | `pnpm tsx scripts/verify-local-flow.ts` | 1 | On the fresh repeat, live resolver checks passed, then acceptance stopped with `FAIL BLOCKED_SUBJECT_CONTRACT` before credential issuance. |
@@ -118,6 +121,9 @@ including the zero-user assertion.
   Chrome to send `Origin: null`. Commit `a736ef5` changes only that policy to
   `same-origin`; exact-Origin validation still rejects null, missing,
   cross-port, and foreign origins.
+- Post-review automated checks require `prompt=login` on every fresh Keycloak
+  authorization and cap broker-to-verifier JSON responses at 64 KiB before
+  parsing. These later controls were not represented as new browser evidence.
 - Keycloak JIT account creation and profile claims are not claimed because the
   live subject-contract preflight did not pass. The restored realm still had
   zero users.
