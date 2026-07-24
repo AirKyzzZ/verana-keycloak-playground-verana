@@ -7,14 +7,17 @@ interface StoredValue<T> {
 
 export interface OpaqueStoreOptions {
   clock?: () => number;
+  maxEntries?: number;
   randomToken?: () => string;
   ttlMs: number;
 }
 
 const defaultRandomToken = () => randomBytes(32).toString("base64url");
+const DEFAULT_MAX_ENTRIES = 1_024;
 
 export class OpaqueStore<T> {
   readonly #clock: () => number;
+  readonly #maxEntries: number;
   readonly #purpose: string;
   readonly #randomToken: () => string;
   readonly #secret: string;
@@ -23,6 +26,7 @@ export class OpaqueStore<T> {
 
   constructor(secret: string, purpose: string, options: OpaqueStoreOptions) {
     this.#clock = options.clock ?? Date.now;
+    this.#maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.#purpose = purpose;
     this.#randomToken = options.randomToken ?? defaultRandomToken;
     this.#secret = secret;
@@ -30,6 +34,12 @@ export class OpaqueStore<T> {
   }
 
   create(value: T): string {
+    this.#sweep();
+    while (this.#values.size >= this.#maxEntries) {
+      const oldest = this.#values.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.#values.delete(oldest);
+    }
     const token = this.#randomToken();
     this.#values.set(this.#key(token), {
       expiresAt: this.#clock() + this.#ttlMs,
@@ -70,11 +80,22 @@ export class OpaqueStore<T> {
     this.#values.delete(this.#key(token));
   }
 
+  get size(): number {
+    return this.#values.size;
+  }
+
   #key(token: string): string {
     return createHmac("sha256", this.#secret)
       .update(this.#purpose)
       .update("\0")
       .update(token)
       .digest("base64url");
+  }
+
+  #sweep(): void {
+    const now = this.#clock();
+    for (const [key, stored] of this.#values) {
+      if (now >= stored.expiresAt) this.#values.delete(key);
+    }
   }
 }

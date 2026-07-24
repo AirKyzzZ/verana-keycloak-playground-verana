@@ -31,9 +31,13 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
 }
 
 async function startAgent(
-  respond: (
-    request: CapturedRequest,
-  ) => { body: unknown; status?: number } | undefined,
+  respond: (request: CapturedRequest) =>
+    | {
+        body: unknown;
+        headers?: Record<string, string>;
+        status?: number;
+      }
+    | undefined,
 ): Promise<FakeAgent> {
   const requests: CapturedRequest[] = [];
   const server = createServer(async (incoming, response) => {
@@ -49,7 +53,10 @@ async function startAgent(
       return;
     }
     response
-      .writeHead(result.status ?? 200, { "content-type": "application/json" })
+      .writeHead(result.status ?? 200, {
+        "content-type": "application/json",
+        ...result.headers,
+      })
       .end(
         typeof result.body === "string"
           ? result.body
@@ -221,6 +228,22 @@ describe("LocalWalletClient", () => {
     expect(shareBody).toEqual({ gateId: "gate-trusted-1" });
   });
 
+  it("rejects a successful HTTP response whose share receipt reports a failure status", async () => {
+    const holder = await startAgent((request) => {
+      if (request.path !== "/oid4vc-demo/wallet/share") return undefined;
+      return { body: { shared: true, status: 500 } };
+    });
+    const client = new LocalWalletClient({
+      issuerBaseUrl: "http://127.0.0.1:1",
+      holderBaseUrl: holder.baseUrl,
+      verifierBaseUrl: "http://127.0.0.1:2",
+    });
+
+    await expect(client.share(positiveResolution())).rejects.toThrow(
+      "vs_agent_unavailable",
+    );
+  });
+
   it.each([
     "TRUSTED_NOT_AUTHORIZED",
     "UNTRUSTED",
@@ -299,5 +322,70 @@ describe("LocalWalletClient", () => {
 
     expect(fetchSpy.mock.calls[0]?.[1]).toMatchObject({ cache: "no-store" });
     expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("rejects an oversized valid-shaped chunked response without exposing its body", async () => {
+    const sensitiveMarker = "oversized-sensitive-receipt";
+    const verifier = await startAgent(() => ({
+      body: JSON.stringify({
+        state: "ResponseVerified",
+        receipt: {
+          padding: `${sensitiveMarker}${"x".repeat(70 * 1024)}`,
+        },
+      }),
+    }));
+    const client = new LocalWalletClient({
+      issuerBaseUrl: "http://127.0.0.1:1",
+      holderBaseUrl: "http://127.0.0.1:2",
+      verifierBaseUrl: verifier.baseUrl,
+    });
+
+    const result = client.getPresentationStatus("verification-1");
+
+    await expect(result).rejects.toThrow("vs_agent_unavailable");
+    await expect(result).rejects.not.toThrow(sensitiveMarker);
+  });
+
+  it("rejects an oversized declared Content-Length before parsing", async () => {
+    const verifier = await startAgent(() => ({
+      body: JSON.stringify({
+        state: "ResponseVerified",
+        receipt: { padding: "x".repeat(70 * 1024) },
+      }),
+      headers: { "content-length": String(70 * 1024) },
+    }));
+    const client = new LocalWalletClient({
+      issuerBaseUrl: "http://127.0.0.1:1",
+      holderBaseUrl: "http://127.0.0.1:2",
+      verifierBaseUrl: verifier.baseUrl,
+    });
+
+    await expect(
+      client.getPresentationStatus("verification-1"),
+    ).rejects.toThrow("vs_agent_unavailable");
+  });
+
+  it("rejects real-shaped responses with unbounded claim arrays", async () => {
+    const holder = await startAgent(() => ({
+      body: {
+        ...positiveResolution(),
+        request: {
+          ...positiveResolution().request,
+          requestedClaims: Array.from(
+            { length: 33 },
+            (_, index) => `claim-${index}`,
+          ),
+        },
+      },
+    }));
+    const client = new LocalWalletClient({
+      issuerBaseUrl: "http://127.0.0.1:1",
+      holderBaseUrl: holder.baseUrl,
+      verifierBaseUrl: "http://127.0.0.1:2",
+    });
+
+    await expect(
+      client.resolveRequest("openid4vp://sensitive-request"),
+    ).rejects.toThrow("vs_agent_unavailable");
   });
 });

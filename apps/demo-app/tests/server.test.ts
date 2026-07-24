@@ -26,6 +26,7 @@ const config: DemoServerOptions["config"] = {
   VS_AGENT_HOLDER_BASE_URL: "http://localhost:3102",
   VS_AGENT_VERIFIER_BASE_URL: "http://localhost:3201",
 };
+const APP_ORIGIN = new URL(config.DEMO_APP_REDIRECT_URI).origin;
 
 const transaction: AuthorizationTransaction = {
   state: "expected-state",
@@ -126,6 +127,33 @@ function cookieValue(
       ? [setCookie]
       : [];
   return headers.find((value) => value.startsWith(`${name}=`));
+}
+
+function csrfToken(response: request.Response): string {
+  const match = response.text.match(
+    /<input[^>]+name="csrfToken"[^>]+value="([^"]+)"/,
+  );
+  if (!match?.[1]) throw new Error("csrf_token_not_rendered");
+  return match[1];
+}
+
+async function openWallet(
+  agent: ReturnType<typeof request.agent>,
+): Promise<string> {
+  return csrfToken(await agent.get("/wallet").expect(200));
+}
+
+function walletMutation(
+  agent: ReturnType<typeof request.agent>,
+  path: "/wallet/issue" | "/wallet/resolve" | "/wallet/share",
+  token: string,
+  body: Record<string, string> = {},
+) {
+  return agent
+    .post(path)
+    .set("Origin", APP_ORIGIN)
+    .type("form")
+    .send({ ...body, csrfToken: token });
 }
 
 async function login(options = createOptions()): Promise<{
@@ -303,15 +331,98 @@ describe("OIDC application routes", () => {
 });
 
 describe("local-holder routes", () => {
+  it("renders one cryptographically random server-bound CSRF token into every wallet form", async () => {
+    const agent = request.agent(createDemoServer(createOptions()).callback());
+
+    const response = await agent.get("/wallet").expect(200);
+    const token = csrfToken(response);
+
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(response.text.match(/name="csrfToken"/g)).toHaveLength(2);
+    expect(
+      response.text.match(new RegExp(`value="${token}"`, "g")),
+    ).toHaveLength(2);
+  });
+
+  it.each(["", "null", "http://localhost:4000"])(
+    "rejects wallet issue with Origin %j before any upstream call",
+    async (origin) => {
+      const options = createOptions();
+      const agent = request.agent(createDemoServer(options).callback());
+      const token = await openWallet(agent);
+      const mutation = agent
+        .post("/wallet/issue")
+        .type("form")
+        .send({ csrfToken: token, subjectId: "local-user" });
+      if (origin) mutation.set("Origin", origin);
+
+      const response = await mutation.expect(403);
+
+      expect(response.text).toContain("Invalid wallet request");
+      expect(options.walletClient.issueBadge).not.toHaveBeenCalled();
+      expect(options.walletClient.acceptOffer).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, "wrong-csrf-token"])(
+    "rejects wallet issue with CSRF token %j before any upstream call",
+    async (token) => {
+      const options = createOptions();
+      const agent = request.agent(createDemoServer(options).callback());
+      await openWallet(agent);
+      const body = {
+        ...(token ? { csrfToken: token } : {}),
+        subjectId: "local-user",
+      };
+
+      const response = await agent
+        .post("/wallet/issue")
+        .set("Origin", APP_ORIGIN)
+        .type("form")
+        .send(body)
+        .expect(403);
+
+      expect(response.text).toContain("Invalid wallet request");
+      expect(options.walletClient.issueBadge).not.toHaveBeenCalled();
+      expect(options.walletClient.acceptOffer).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["/wallet/issue", "issueBadge"],
+    ["/wallet/resolve", "resolveRequest"],
+    ["/wallet/share", "share"],
+  ] as const)(
+    "protects %s even when a localhost cross-port page submits the form",
+    async (path, method) => {
+      const options = createOptions();
+      const agent = request.agent(createDemoServer(options).callback());
+      await openWallet(agent);
+
+      const response = await agent
+        .post(path)
+        .set("Origin", "http://localhost:9999")
+        .type("form")
+        .send({
+          csrfToken: "attacker-token",
+          subjectId: "local-user",
+          authorizationRequest: "openid4vp://attacker-request",
+        })
+        .expect(403);
+
+      expect(response.text).toContain("Invalid wallet request");
+      expect(options.walletClient[method]).not.toHaveBeenCalled();
+    },
+  );
+
   it("issues exact ACME employee claims and accepts only through the local holder", async () => {
     const options = createOptions();
     const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
 
-    const response = await agent
-      .post("/wallet/issue")
-      .type("form")
-      .send({ subjectId: "local-user" })
-      .expect(200);
+    const response = await walletMutation(agent, "/wallet/issue", token, {
+      subjectId: "local-user",
+    }).expect(200);
 
     expect(options.walletClient.issueBadge).toHaveBeenCalledWith("local-user");
     expect(options.walletClient.acceptOffer).toHaveBeenCalledWith(
@@ -337,20 +448,19 @@ describe("local-holder routes", () => {
   it("shares only the server-stored gate returned by a positive resolution", async () => {
     const options = createOptions();
     const agent = request.agent(createDemoServer(options).callback());
-    await agent
-      .post("/wallet/resolve")
-      .type("form")
-      .send({ authorizationRequest: "openid4vp://broker-request" })
-      .expect(200);
+    const token = await openWallet(agent);
+    await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://broker-request",
+    }).expect(200);
 
-    const response = await agent
-      .post("/wallet/share")
-      .type("form")
-      .send({ gateId: "browser-forged-gate", verdict: "UNTRUSTED" })
-      .expect(200);
+    const response = await walletMutation(agent, "/wallet/share", token, {
+      gateId: "browser-forged-gate",
+      verdict: "UNTRUSTED",
+    }).expect(200);
 
     expect(options.walletClient.share).toHaveBeenCalledWith(positiveResolution);
     expect(response.text).toContain("Presentation shared");
+    expect(response.text).not.toContain("Share approved claims");
   });
 
   it.each([
@@ -364,13 +474,14 @@ describe("local-holder routes", () => {
       verdict,
     });
     const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
 
-    const resolved = await agent
-      .post("/wallet/resolve")
-      .type("form")
-      .send({ authorizationRequest: "openid4vp://broker-request" })
-      .expect(200);
-    const shared = await agent.post("/wallet/share").expect(403);
+    const resolved = await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://broker-request",
+    }).expect(200);
+    const shared = await walletMutation(agent, "/wallet/share", token).expect(
+      403,
+    );
 
     expect(resolved.text).toContain("Sharing refused");
     expect(shared.text).toContain("Sharing refused");
@@ -388,11 +499,11 @@ describe("local-holder routes", () => {
       },
     });
 
-    const response = await request(createDemoServer(options).callback())
-      .post("/wallet/resolve")
-      .type("form")
-      .send({ authorizationRequest: "openid4vp://broker-request" })
-      .expect(200);
+    const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
+    const response = await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://broker-request",
+    }).expect(200);
 
     expect(response.text).not.toContain("<script>alert(1)</script>");
     expect(response.text).not.toContain("<img src=x onerror=alert(1)>");
@@ -405,14 +516,148 @@ describe("local-holder routes", () => {
       new Error("upstream credential and authorization request body"),
     );
 
-    const response = await request(createDemoServer(options).callback())
-      .post("/wallet/resolve")
-      .type("form")
-      .send({ authorizationRequest: "openid4vp://sensitive-request" })
-      .expect(502);
+    const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
+    const response = await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://sensitive-request",
+    }).expect(502);
 
     expect(response.text).toContain("Local VS Agent unavailable");
     expect(response.text).not.toContain("upstream credential");
     expect(response.text).not.toContain("openid4vp://sensitive-request");
+  });
+
+  it("claims a positive gate before awaiting share so concurrent posts call the holder once", async () => {
+    let releaseShare: (() => void) | undefined;
+    const shareGate = new Promise<void>((resolve) => {
+      releaseShare = resolve;
+    });
+    const options = createOptions();
+    options.walletClient.share.mockImplementationOnce(async () => {
+      await shareGate;
+      return { shared: true, status: 200 };
+    });
+    const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
+    await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://broker-request",
+    }).expect(200);
+
+    const firstShare = walletMutation(agent, "/wallet/share", token).then(
+      (response) => response,
+    );
+    await vi.waitFor(() => {
+      expect(options.walletClient.share).toHaveBeenCalledOnce();
+    });
+    const secondResponse = await walletMutation(agent, "/wallet/share", token);
+    releaseShare?.();
+    const firstResponse = await firstShare;
+
+    expect(firstResponse.status).toBe(200);
+    expect(secondResponse.status).toBe(409);
+    expect(secondResponse.text).toContain("Sharing already in progress");
+    expect(options.walletClient.share).toHaveBeenCalledOnce();
+  });
+
+  it("blocks retry after an uncertain upstream share failure", async () => {
+    const options = createOptions();
+    options.walletClient.share.mockRejectedValueOnce(
+      new Error("holder response lost after submission"),
+    );
+    const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
+    await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://broker-request",
+    }).expect(200);
+
+    await walletMutation(agent, "/wallet/share", token).expect(502);
+    const retry = await walletMutation(agent, "/wallet/share", token).expect(
+      409,
+    );
+
+    expect(retry.text).toContain("Sharing outcome is uncertain");
+    expect(options.walletClient.share).toHaveBeenCalledOnce();
+  });
+
+  it("invalidates a previous positive gate before awaiting a new resolve", async () => {
+    let rejectResolve: ((error: Error) => void) | undefined;
+    const secondResolve = new Promise<ResolvedPresentation>(
+      (_resolve, reject) => {
+        rejectResolve = reject;
+      },
+    );
+    const options = createOptions();
+    options.walletClient.resolveRequest
+      .mockResolvedValueOnce(positiveResolution)
+      .mockImplementationOnce(async () => await secondResolve);
+    const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
+    await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://first-request",
+    }).expect(200);
+
+    const pendingResolve = walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://second-request",
+    }).then((response) => response);
+    await vi.waitFor(() => {
+      expect(options.walletClient.resolveRequest).toHaveBeenCalledTimes(2);
+    });
+    const shareWhileResolving = await walletMutation(
+      agent,
+      "/wallet/share",
+      token,
+    );
+    rejectResolve?.(new Error("new resolver failure"));
+    const failedResolve = await pendingResolve;
+
+    expect(shareWhileResolving.status).toBe(409);
+    expect(failedResolve.status).toBe(502);
+    expect(options.walletClient.share).not.toHaveBeenCalled();
+  });
+
+  it("keeps a failed replacement resolve from exposing the previous positive gate", async () => {
+    const options = createOptions();
+    options.walletClient.resolveRequest
+      .mockResolvedValueOnce(positiveResolution)
+      .mockRejectedValueOnce(new Error("new resolver failure"));
+    const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
+    await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://first-request",
+    }).expect(200);
+
+    await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://replacement-request",
+    }).expect(502);
+    const share = await walletMutation(agent, "/wallet/share", token).expect(
+      409,
+    );
+
+    expect(share.text).toContain("Resolve and review a new request");
+    expect(options.walletClient.share).not.toHaveBeenCalled();
+  });
+
+  it("clears stale shared success when a new request resolves", async () => {
+    const options = createOptions();
+    options.walletClient.resolveRequest
+      .mockResolvedValueOnce(positiveResolution)
+      .mockResolvedValueOnce({
+        ...positiveResolution,
+        gateId: "gate-denied-2",
+        verdict: "TRUSTED_NOT_AUTHORIZED",
+      });
+    const agent = request.agent(createDemoServer(options).callback());
+    const token = await openWallet(agent);
+    await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://first-request",
+    }).expect(200);
+    await walletMutation(agent, "/wallet/share", token).expect(200);
+
+    const replacement = await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://replacement-request",
+    }).expect(200);
+
+    expect(replacement.text).toContain("Sharing refused");
+    expect(replacement.text).not.toContain("Presentation shared");
   });
 });

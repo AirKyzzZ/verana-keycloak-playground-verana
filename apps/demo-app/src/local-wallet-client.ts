@@ -2,6 +2,14 @@ import { z } from "zod";
 
 const REQUEST_TIMEOUT_MS = 3_000;
 const MAX_EXCHANGE_VALUE_LENGTH = 10_000;
+const MAX_IDENTIFIER_LENGTH = 200;
+const MAX_URL_LENGTH = 2_048;
+const MAX_COLLECTION_ITEMS = 32;
+const MAX_OBJECT_KEYS = 64;
+
+// Demo responses contain summaries, not credentials. 64 KiB leaves ample room
+// for trust evidence while bounding compressed, chunked, and declared bodies.
+const MAX_RESPONSE_BODY_BYTES = 64 * 1_024;
 
 const verdictSchema = z.enum([
   "TRUSTED_AUTHORIZED",
@@ -12,41 +20,47 @@ const verdictSchema = z.enum([
 
 const issuedBadgeResponseSchema = z.strictObject({
   credentialOffer: z.string().trim().min(1).max(MAX_EXCHANGE_VALUE_LENGTH),
-  credentialOfferObject: z.record(z.string(), z.unknown()),
-  issuanceSessionId: z.string().trim().min(1).max(200),
+  credentialOfferObject: z
+    .record(z.string().max(MAX_IDENTIFIER_LENGTH), z.unknown())
+    .refine((value) => Object.keys(value).length <= MAX_OBJECT_KEYS),
+  issuanceSessionId: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
 });
 
 const acceptedBadgeResponseSchema = z.strictObject({
-  id: z.string().trim().min(1).max(200),
-  vct: z.string().url(),
-  claims: z.record(z.string(), z.unknown()),
+  id: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
+  vct: z.string().max(MAX_URL_LENGTH).url(),
+  claims: z
+    .record(z.string().max(MAX_IDENTIFIER_LENGTH), z.unknown())
+    .refine((value) => Object.keys(value).length <= MAX_OBJECT_KEYS),
 });
 
 const evidenceSchema = z.strictObject({
-  did: z.string().nullable(),
+  did: z.string().max(MAX_URL_LENGTH).nullable(),
   trustStatus: z.enum(["TRUSTED", "PARTIAL", "UNTRUSTED"]).nullable(),
   authorized: z.boolean().nullable(),
-  vtjscId: z.string().nullable(),
-  queries: z.array(z.string()),
-  note: z.string().optional(),
+  vtjscId: z.string().max(MAX_URL_LENGTH).nullable(),
+  queries: z.array(z.string().max(MAX_URL_LENGTH)).max(MAX_COLLECTION_ITEMS),
+  note: z.string().max(500).optional(),
 });
 
 const resolvedPresentationSchema = z.strictObject({
-  gateId: z.string().trim().min(1).max(200),
+  gateId: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
   verdict: verdictSchema,
   evidence: evidenceSchema,
   request: z.strictObject({
-    clientId: z.string().trim().min(1),
-    clientIdPrefix: z.string().trim().min(1),
-    verifierDid: z.string().nullable(),
-    requestedVct: z.string().nullable(),
-    requestedClaims: z.array(z.string()),
+    clientId: z.string().trim().min(1).max(MAX_URL_LENGTH),
+    clientIdPrefix: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
+    verifierDid: z.string().max(MAX_URL_LENGTH).nullable(),
+    requestedVct: z.string().max(MAX_URL_LENGTH).nullable(),
+    requestedClaims: z
+      .array(z.string().max(MAX_IDENTIFIER_LENGTH))
+      .max(MAX_COLLECTION_ITEMS),
   }),
 });
 
 const presentationRequestSchema = z.strictObject({
   authorizationRequest: z.string().trim().min(1).max(MAX_EXCHANGE_VALUE_LENGTH),
-  sessionId: z.string().trim().min(1).max(200),
+  sessionId: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
 });
 
 const pendingPresentationSchema = z.strictObject({
@@ -54,6 +68,7 @@ const pendingPresentationSchema = z.strictObject({
     .string()
     .trim()
     .min(1)
+    .max(MAX_IDENTIFIER_LENGTH)
     .refine((state) => state !== "ResponseVerified"),
 });
 const verifiedPresentationSchema = z.strictObject({
@@ -67,7 +82,7 @@ const presentationStatusSchema = z.union([
 
 const sharedPresentationSchema = z.strictObject({
   shared: z.literal(true),
-  status: z.number().int().min(100).max(599),
+  status: z.number().int().min(200).max(299),
 });
 
 export type VeranaVerdict = z.infer<typeof verdictSchema>;
@@ -226,7 +241,15 @@ export class LocalWalletClient implements LocalWalletClientContract {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (!response.ok) throw new Error("request_failed");
-      return schema.parse(await response.json());
+      if (
+        !response.headers
+          .get("content-type")
+          ?.toLowerCase()
+          .startsWith("application/json")
+      ) {
+        throw new Error("response_content_type_invalid");
+      }
+      return schema.parse(await readBoundedJson(response));
     } catch {
       throw new Error("vs_agent_unavailable");
     }
@@ -235,4 +258,45 @@ export class LocalWalletClient implements LocalWalletClientContract {
 
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+async function readBoundedJson(response: Response): Promise<unknown> {
+  const declaredLength = response.headers.get("content-length");
+  if (declaredLength !== null) {
+    if (!/^\d+$/.test(declaredLength)) {
+      throw new Error("response_length_invalid");
+    }
+    if (Number(declaredLength) > MAX_RESPONSE_BODY_BYTES) {
+      await response.body?.cancel();
+      throw new Error("response_too_large");
+    }
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("response_body_missing");
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BODY_BYTES) {
+        await reader.cancel();
+        throw new Error("response_too_large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  return JSON.parse(text);
 }

@@ -7,8 +7,19 @@ import type {
 
 export interface WalletPageState {
   acceptedBadge?: AcceptedBadge;
+  csrfToken: string;
   resolution?: ResolvedPresentation;
   shared?: SharedPresentation;
+  workflowStatus:
+    | "idle"
+    | "issuing"
+    | "issue_failed"
+    | "resolving"
+    | "resolve_failed"
+    | "resolved"
+    | "sharing"
+    | "shared"
+    | "share_uncertain";
 }
 
 export function escapeHtml(value: string): string {
@@ -69,7 +80,8 @@ export function renderProfilePage(
   );
 }
 
-export function renderWalletPage(state: WalletPageState = {}): string {
+export function renderWalletPage(state: WalletPageState): string {
+  const csrfField = `<input type="hidden" name="csrfToken" value="${escapeHtml(state.csrfToken)}">`;
   const credential = state.acceptedBadge
     ? `
         <section class="result">
@@ -85,10 +97,17 @@ export function renderWalletPage(state: WalletPageState = {}): string {
         </section>
       `
     : "";
-  const resolution = state.resolution ? renderResolution(state.resolution) : "";
+  const resolution = state.resolution
+    ? renderResolution(
+        state.resolution,
+        csrfField,
+        state.workflowStatus === "resolved",
+      )
+    : "";
   const shared = state.shared?.shared
     ? `<p class="success">Presentation shared through the local holder.</p>`
     : "";
+  const workflowNotice = renderWorkflowNotice(state.workflowStatus);
 
   return renderDocument(
     "Local holder",
@@ -107,16 +126,19 @@ export function renderWalletPage(state: WalletPageState = {}): string {
         <li>Share only if the exact verdict is <code>TRUSTED_AUTHORIZED</code>.</li>
       </ol>
       <form method="post" action="/wallet/issue">
+        ${csrfField}
         <label for="subject-id">Opaque demo subject</label>
         <input id="subject-id" name="subjectId" required maxlength="200" value="local-demo-user">
         <button type="submit">Issue and accept badge</button>
       </form>
       ${credential}
       <form method="post" action="/wallet/resolve">
+        ${csrfField}
         <label for="authorization-request">Broker authorization request</label>
         <textarea id="authorization-request" name="authorizationRequest" required maxlength="10000"></textarea>
         <button type="submit">Resolve and review request</button>
       </form>
+      ${workflowNotice}
       ${resolution}
       ${shared}
       <p><a href="/">Return to protected application</a></p>
@@ -135,19 +157,25 @@ export function renderErrorPage(title: string, message: string): string {
   );
 }
 
-function renderResolution(resolution: ResolvedPresentation): string {
+function renderResolution(
+  resolution: ResolvedPresentation,
+  csrfField: string,
+  canShare: boolean,
+): string {
   const positive = resolution.verdict === "TRUSTED_AUTHORIZED";
   const requestedClaims = resolution.request.requestedClaims
     .map((claim) => `<li><code>${escapeHtml(claim)}</code></li>`)
     .join("");
   const verdictClass = positive ? "success" : "error";
-  const action = positive
-    ? `
+  const action =
+    positive && canShare
+      ? `
         <form method="post" action="/wallet/share">
+          ${csrfField}
           <button type="submit">Share approved claims</button>
         </form>
       `
-    : `<p class="error">Sharing refused. The verifier is not both trusted and authorized.</p>`;
+      : `<p class="error">Sharing refused. The verifier is not both trusted and authorized.</p>`;
 
   return `
     <section class="result">
@@ -168,6 +196,27 @@ function renderResolution(resolution: ResolvedPresentation): string {
       ${action}
     </section>
   `;
+}
+
+function renderWorkflowNotice(
+  status: WalletPageState["workflowStatus"],
+): string {
+  switch (status) {
+    case "issuing":
+      return `<p class="warning">Badge issuance is in progress.</p>`;
+    case "issue_failed":
+      return `<p class="error">Badge issuance failed. Any previous sharing approval has been discarded.</p>`;
+    case "resolving":
+      return `<p class="warning">A new request is being resolved. Any previous sharing approval has been discarded.</p>`;
+    case "resolve_failed":
+      return `<p class="error">The new request could not be resolved. Resolve and review a new request before sharing.</p>`;
+    case "sharing":
+      return `<p class="warning">Presentation sharing is in progress.</p>`;
+    case "share_uncertain":
+      return `<p class="error">Sharing outcome is uncertain. Resolve and review a new request before any further attempt.</p>`;
+    default:
+      return "";
+  }
 }
 
 function renderDocument(title: string, content: string): string {

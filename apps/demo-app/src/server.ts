@@ -1,3 +1,5 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
+
 import Router from "@koa/router";
 import Koa, { type Context } from "koa";
 import bodyParser from "koa-bodyparser";
@@ -15,10 +17,7 @@ import type {
   KeycloakClientContract,
   KeycloakIdentity,
 } from "./keycloak-client.js";
-import type {
-  LocalWalletClientContract,
-  ResolvedPresentation,
-} from "./local-wallet-client.js";
+import type { LocalWalletClientContract } from "./local-wallet-client.js";
 import { OpaqueStore } from "./session-store.js";
 
 const AUTH_COOKIE = "verana_auth";
@@ -27,9 +26,17 @@ const WALLET_COOKIE = "verana_wallet";
 const AUTH_TTL_MS = 5 * 60 * 1_000;
 const SESSION_TTL_MS = 60 * 60 * 1_000;
 const WALLET_TTL_MS = 30 * 60 * 1_000;
+const AUTH_MAX_ENTRIES = 1_024;
+const SESSION_MAX_ENTRIES = 1_024;
+const WALLET_MAX_ENTRIES = 512;
 
 interface WalletWorkflow extends WalletPageState {
-  resolution?: ResolvedPresentation;
+  operationId?: string;
+}
+
+interface WalletAccess {
+  token: string;
+  workflow: WalletWorkflow;
 }
 
 export interface DemoServerOptions {
@@ -40,22 +47,23 @@ export interface DemoServerOptions {
 
 export function createDemoServer(options: DemoServerOptions): Koa {
   const { config, keycloakClient, walletClient } = options;
-  const secureCookies =
-    new URL(config.DEMO_APP_REDIRECT_URI).protocol === "https:";
+  const applicationUrl = new URL(config.DEMO_APP_REDIRECT_URI);
+  const expectedOrigin = applicationUrl.origin;
+  const secureCookies = applicationUrl.protocol === "https:";
   const authStore = new OpaqueStore<AuthorizationTransaction>(
     config.SESSION_SECRET,
     "authorization",
-    { ttlMs: AUTH_TTL_MS },
+    { maxEntries: AUTH_MAX_ENTRIES, ttlMs: AUTH_TTL_MS },
   );
   const sessionStore = new OpaqueStore<KeycloakIdentity>(
     config.SESSION_SECRET,
     "session",
-    { ttlMs: SESSION_TTL_MS },
+    { maxEntries: SESSION_MAX_ENTRIES, ttlMs: SESSION_TTL_MS },
   );
   const walletStore = new OpaqueStore<WalletWorkflow>(
     config.SESSION_SECRET,
     "wallet",
-    { ttlMs: WALLET_TTL_MS },
+    { maxEntries: WALLET_MAX_ENTRIES, ttlMs: WALLET_TTL_MS },
   );
   const app = new Koa();
   const router = new Router();
@@ -173,11 +181,17 @@ export function createDemoServer(options: DemoServerOptions): Koa {
   });
 
   router.get("/wallet", (context) => {
-    const workflow = readWalletWorkflow(context, walletStore);
+    const { workflow } = ensureWalletWorkflow(
+      context,
+      walletStore,
+      secureCookies,
+    );
     html(context, 200, renderWalletPage(workflow));
   });
 
   router.post("/wallet/issue", async (context) => {
+    const access = requireWalletMutation(context, walletStore, expectedOrigin);
+    if (!access) return;
     const subjectId = formString(context, "subjectId", 200);
     if (!subjectId) {
       html(
@@ -190,21 +204,57 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       );
       return;
     }
+    if (isOperationInProgress(access.workflow.workflowStatus)) {
+      renderWorkflowConflict(context, access.workflow.workflowStatus);
+      return;
+    }
+    const operationId = randomOpaqueValue();
+    const pending: WalletWorkflow = {
+      csrfToken: access.workflow.csrfToken,
+      operationId,
+      workflowStatus: "issuing",
+    };
+    if (!walletStore.replace(access.token, pending)) {
+      renderExpiredWallet(context);
+      return;
+    }
+
     try {
       const issued = await walletClient.issueBadge(subjectId);
       const acceptedBadge = await walletClient.acceptOffer(
         issued.credentialOffer,
       );
-      const existing = readWalletWorkflow(context, walletStore);
-      const workflow: WalletWorkflow = { ...existing, acceptedBadge };
-      saveWalletWorkflow(context, walletStore, workflow, secureCookies);
+      if (
+        !isCurrentOperation(walletStore, access.token, "issuing", operationId)
+      ) {
+        renderSupersededWallet(context);
+        return;
+      }
+      const workflow: WalletWorkflow = {
+        acceptedBadge,
+        csrfToken: access.workflow.csrfToken,
+        workflowStatus: "idle",
+      };
+      walletStore.replace(access.token, workflow);
       html(context, 200, renderWalletPage(workflow));
     } catch {
+      replaceCurrentOperation(
+        walletStore,
+        access.token,
+        "issuing",
+        operationId,
+        {
+          csrfToken: access.workflow.csrfToken,
+          workflowStatus: "issue_failed",
+        },
+      );
       renderVsAgentUnavailable(context);
     }
   });
 
   router.post("/wallet/resolve", async (context) => {
+    const access = requireWalletMutation(context, walletStore, expectedOrigin);
+    if (!access) return;
     const authorizationRequest = formString(
       context,
       "authorizationRequest",
@@ -221,28 +271,100 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       );
       return;
     }
+    if (
+      access.workflow.workflowStatus === "issuing" ||
+      access.workflow.workflowStatus === "sharing"
+    ) {
+      renderWorkflowConflict(context, access.workflow.workflowStatus);
+      return;
+    }
+    const operationId = randomOpaqueValue();
+    const pending: WalletWorkflow = {
+      ...(access.workflow.acceptedBadge
+        ? { acceptedBadge: access.workflow.acceptedBadge }
+        : {}),
+      csrfToken: access.workflow.csrfToken,
+      operationId,
+      workflowStatus: "resolving",
+    };
+    if (!walletStore.replace(access.token, pending)) {
+      renderExpiredWallet(context);
+      return;
+    }
+
     try {
       const resolution =
         await walletClient.resolveRequest(authorizationRequest);
-      const existing = readWalletWorkflow(context, walletStore);
-      const workflow: WalletWorkflow = { ...existing, resolution };
-      saveWalletWorkflow(context, walletStore, workflow, secureCookies);
+      if (
+        !isCurrentOperation(walletStore, access.token, "resolving", operationId)
+      ) {
+        renderSupersededWallet(context);
+        return;
+      }
+      const workflow: WalletWorkflow = {
+        ...(access.workflow.acceptedBadge
+          ? { acceptedBadge: access.workflow.acceptedBadge }
+          : {}),
+        csrfToken: access.workflow.csrfToken,
+        resolution,
+        workflowStatus: "resolved",
+      };
+      walletStore.replace(access.token, workflow);
       html(context, 200, renderWalletPage(workflow));
     } catch {
+      replaceCurrentOperation(
+        walletStore,
+        access.token,
+        "resolving",
+        operationId,
+        {
+          ...(access.workflow.acceptedBadge
+            ? { acceptedBadge: access.workflow.acceptedBadge }
+            : {}),
+          csrfToken: access.workflow.csrfToken,
+          workflowStatus: "resolve_failed",
+        },
+      );
       renderVsAgentUnavailable(context);
     }
   });
 
   router.post("/wallet/share", async (context) => {
-    const workflow = readWalletWorkflow(context, walletStore);
-    const resolution = workflow.resolution;
-    if (!resolution) {
+    const access = requireWalletMutation(context, walletStore, expectedOrigin);
+    if (!access) return;
+    if (access.workflow.workflowStatus === "sharing") {
       html(
         context,
-        400,
+        409,
         renderErrorPage(
-          "No reviewed request",
-          "Resolve and review a broker request before sharing.",
+          "Sharing already in progress",
+          "Wait for the local holder response before taking another action.",
+        ),
+      );
+      return;
+    }
+    if (access.workflow.workflowStatus === "share_uncertain") {
+      html(
+        context,
+        409,
+        renderErrorPage(
+          "Sharing outcome is uncertain",
+          "Resolve and review a new request before any further sharing attempt.",
+        ),
+      );
+      return;
+    }
+    const resolution = access.workflow.resolution;
+    if (
+      access.workflow.workflowStatus !== "resolved" ||
+      resolution === undefined
+    ) {
+      html(
+        context,
+        409,
+        renderErrorPage(
+          "No current reviewed request",
+          "Resolve and review a new request before sharing.",
         ),
       );
       return;
@@ -258,25 +380,61 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       );
       return;
     }
-    if (workflow.shared) {
-      html(
-        context,
-        409,
-        renderErrorPage(
-          "Request already shared",
-          "Resolve a new broker request before sharing again.",
-        ),
-      );
+    const operationId = randomOpaqueValue();
+    const pending: WalletWorkflow = {
+      ...(access.workflow.acceptedBadge
+        ? { acceptedBadge: access.workflow.acceptedBadge }
+        : {}),
+      csrfToken: access.workflow.csrfToken,
+      operationId,
+      workflowStatus: "sharing",
+    };
+    if (!walletStore.replace(access.token, pending)) {
+      renderExpiredWallet(context);
       return;
     }
 
     try {
       const shared = await walletClient.share(resolution);
-      const updated = { ...workflow, shared };
-      saveWalletWorkflow(context, walletStore, updated, secureCookies);
+      if (
+        !isCurrentOperation(walletStore, access.token, "sharing", operationId)
+      ) {
+        renderSupersededWallet(context);
+        return;
+      }
+      const updated: WalletWorkflow = {
+        ...(access.workflow.acceptedBadge
+          ? { acceptedBadge: access.workflow.acceptedBadge }
+          : {}),
+        csrfToken: access.workflow.csrfToken,
+        resolution,
+        shared,
+        workflowStatus: "shared",
+      };
+      walletStore.replace(access.token, updated);
       html(context, 200, renderWalletPage(updated));
     } catch {
-      renderVsAgentUnavailable(context);
+      replaceCurrentOperation(
+        walletStore,
+        access.token,
+        "sharing",
+        operationId,
+        {
+          ...(access.workflow.acceptedBadge
+            ? { acceptedBadge: access.workflow.acceptedBadge }
+            : {}),
+          csrfToken: access.workflow.csrfToken,
+          workflowStatus: "share_uncertain",
+        },
+      );
+      html(
+        context,
+        502,
+        renderErrorPage(
+          "Sharing outcome is uncertain",
+          "The holder response was not verified. Resolve and review a new request before any further sharing attempt.",
+        ),
+      );
     }
   });
 
@@ -332,12 +490,94 @@ function html(context: Context, status: number, body: string): void {
   context.body = body;
 }
 
-function readWalletWorkflow(
+function ensureWalletWorkflow(
   context: Context,
   store: OpaqueStore<WalletWorkflow>,
-): WalletWorkflow {
+  secure: boolean,
+): WalletAccess {
+  const currentToken = context.cookies.get(WALLET_COOKIE);
+  const currentWorkflow = currentToken ? store.get(currentToken) : undefined;
+  if (currentToken && currentWorkflow) {
+    return { token: currentToken, workflow: currentWorkflow };
+  }
+  const workflow: WalletWorkflow = {
+    csrfToken: randomOpaqueValue(),
+    workflowStatus: "idle",
+  };
+  const token = store.create(workflow);
+  setOpaqueCookie(context, WALLET_COOKIE, token, secure, WALLET_TTL_MS);
+  return { token, workflow };
+}
+
+function isCurrentOperation(
+  store: OpaqueStore<WalletWorkflow>,
+  token: string,
+  status: WalletWorkflow["workflowStatus"],
+  operationId: string,
+): boolean {
+  const workflow = store.get(token);
+  return (
+    workflow?.workflowStatus === status && workflow.operationId === operationId
+  );
+}
+
+function isOperationInProgress(
+  status: WalletWorkflow["workflowStatus"],
+): boolean {
+  return status === "issuing" || status === "resolving" || status === "sharing";
+}
+
+function randomOpaqueValue(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+function replaceCurrentOperation(
+  store: OpaqueStore<WalletWorkflow>,
+  token: string,
+  status: WalletWorkflow["workflowStatus"],
+  operationId: string,
+  replacement: WalletWorkflow,
+): void {
+  if (isCurrentOperation(store, token, status, operationId)) {
+    store.replace(token, replacement);
+  }
+}
+
+function requireWalletMutation(
+  context: Context,
+  store: OpaqueStore<WalletWorkflow>,
+  expectedOrigin: string,
+): WalletAccess | undefined {
   const token = context.cookies.get(WALLET_COOKIE);
-  return (token ? store.get(token) : undefined) ?? {};
+  const workflow = token ? store.get(token) : undefined;
+  const submittedToken = formString(context, "csrfToken", 100);
+  if (
+    context.get("Origin") !== expectedOrigin ||
+    !token ||
+    !workflow ||
+    !submittedToken ||
+    !tokensEqual(workflow.csrfToken, submittedToken)
+  ) {
+    html(
+      context,
+      403,
+      renderErrorPage(
+        "Invalid wallet request",
+        "Reload the local holder page before trying again.",
+      ),
+    );
+    return undefined;
+  }
+  return { token, workflow };
+}
+
+function tokensEqual(expected: string, actual: string): boolean {
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const actualBytes = Buffer.from(actual, "utf8");
+  return (
+    expectedBytes.byteLength === actualBytes.byteLength &&
+    timingSafeEqual(expectedBytes, actualBytes)
+  );
 }
 
 function renderVsAgentUnavailable(context: Context): void {
@@ -351,16 +591,46 @@ function renderVsAgentUnavailable(context: Context): void {
   );
 }
 
-function saveWalletWorkflow(
+function renderExpiredWallet(context: Context): void {
+  html(
+    context,
+    409,
+    renderErrorPage(
+      "Local holder session expired",
+      "Reload the local holder page before trying again.",
+    ),
+  );
+}
+
+function renderSupersededWallet(context: Context): void {
+  html(
+    context,
+    409,
+    renderErrorPage(
+      "Wallet workflow changed",
+      "Reload the local holder page to review the current state.",
+    ),
+  );
+}
+
+function renderWorkflowConflict(
   context: Context,
-  store: OpaqueStore<WalletWorkflow>,
-  workflow: WalletWorkflow,
-  secure: boolean,
+  status: WalletWorkflow["workflowStatus"],
 ): void {
-  const currentToken = context.cookies.get(WALLET_COOKIE);
-  if (currentToken && store.replace(currentToken, workflow)) return;
-  const token = store.create(workflow);
-  setOpaqueCookie(context, WALLET_COOKIE, token, secure, WALLET_TTL_MS);
+  const action =
+    status === "issuing"
+      ? "Badge issuance"
+      : status === "resolving"
+        ? "Request resolution"
+        : "Presentation sharing";
+  html(
+    context,
+    409,
+    renderErrorPage(
+      `${action} already in progress`,
+      "Wait for the current operation before taking another action.",
+    ),
+  );
 }
 
 function setOpaqueCookie(
