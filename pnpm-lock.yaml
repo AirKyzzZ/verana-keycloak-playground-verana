@@ -110,6 +110,22 @@ importers:
         specifier: 7.2.2
         version: 7.2.2
 
+  apps/local-resolver:
+    dependencies:
+      '@koa/router':
+        specifier: 15.7.0
+        version: 15.7.0(koa@3.2.1)
+      koa:
+        specifier: 3.2.1
+        version: 3.2.1
+    devDependencies:
+      '@types/koa':
+        specifier: 2.15.0
+        version: 2.15.0
+      supertest:
+        specifier: 7.2.2
+        version: 7.2.2
+
 packages:
 
   '@biomejs/biome@2.5.5':
