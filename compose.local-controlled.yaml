@@ -1,0 +1,110 @@
+name: verana-keycloak-local-controlled
+
+services:
+  issuer:
+    build:
+      context: ${VS_AGENT_SOURCE_PATH}
+      dockerfile: apps/vs-agent/Dockerfile
+      target: vs-agent-openid4vc
+    image: ${VS_AGENT_IMAGE}
+    ports:
+      - "127.0.0.1:3100:3000"
+      - "127.0.0.1:3101:3001"
+    environment:
+      ADMIN_PORT: 3000
+      AGENT_PORT: 3001
+      AGENT_PUBLIC_DID: did:web:issuer.localhost
+      PUBLIC_API_BASE_URL: http://host.docker.internal:3101
+      AGENT_ENDPOINTS: ws://host.docker.internal:3101
+      AGENT_WALLET_ID: ${ISSUER_WALLET_ID}
+      AGENT_WALLET_KEY: ${ISSUER_WALLET_KEY}
+      VS_AGENT_PLUGINS: messaging,openid4vc
+      OID4VC_ISSUER_ENABLED: "true"
+      OID4VC_HOLDER_ENABLED: "false"
+      OID4VC_VERIFIER_ENABLED: "false"
+      OID4VC_REQUEST_SIGNER: x5c
+      OID4VC_ISSUER_SIGNER: x5c
+      VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
+      UNFOLD_VCT: ${UNFOLD_VCT}
+      UNFOLD_VTJSC_ID: ${UNFOLD_VTJSC_ID}
+      ROGUE_VERIFIER_DID: ${ROGUE_VERIFIER_DID}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - issuer-afj:/root/.afj
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"Promise.all(['http://127.0.0.1:3000/v1/health', 'http://127.0.0.1:3001/oid4vc-demo/capabilities'].map((url) => fetch(url))).then((responses) => process.exit(responses.every((response) => response.ok) ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  holder:
+    image: ${VS_AGENT_IMAGE}
+    ports:
+      - "127.0.0.1:3110:3000"
+      - "127.0.0.1:3111:3001"
+    environment:
+      ADMIN_PORT: 3000
+      AGENT_PORT: 3001
+      AGENT_PUBLIC_DID: did:web:holder.localhost
+      PUBLIC_API_BASE_URL: http://host.docker.internal:3111
+      AGENT_ENDPOINTS: ws://host.docker.internal:3111
+      AGENT_WALLET_ID: ${HOLDER_WALLET_ID}
+      AGENT_WALLET_KEY: ${HOLDER_WALLET_KEY}
+      VS_AGENT_PLUGINS: messaging,openid4vc
+      OID4VC_ISSUER_ENABLED: "false"
+      OID4VC_HOLDER_ENABLED: "true"
+      OID4VC_VERIFIER_ENABLED: "false"
+      OID4VC_REQUEST_SIGNER: x5c
+      OID4VC_ISSUER_SIGNER: x5c
+      VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
+      UNFOLD_VCT: ${UNFOLD_VCT}
+      UNFOLD_VTJSC_ID: ${UNFOLD_VTJSC_ID}
+      ROGUE_VERIFIER_DID: ${ROGUE_VERIFIER_DID}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - holder-afj:/root/.afj
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"Promise.all(['http://127.0.0.1:3000/v1/health', 'http://127.0.0.1:3001/oid4vc-demo/capabilities'].map((url) => fetch(url))).then((responses) => process.exit(responses.every((response) => response.ok) ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  verifier:
+    image: ${VS_AGENT_IMAGE}
+    ports:
+      - "127.0.0.1:3200:3000"
+      - "127.0.0.1:3201:3001"
+    environment:
+      ADMIN_PORT: 3000
+      AGENT_PORT: 3001
+      AGENT_PUBLIC_DID: did:web:verifier.localhost
+      PUBLIC_API_BASE_URL: http://host.docker.internal:3201
+      AGENT_ENDPOINTS: ws://host.docker.internal:3201
+      AGENT_WALLET_ID: ${VERIFIER_WALLET_ID}
+      AGENT_WALLET_KEY: ${VERIFIER_WALLET_KEY}
+      VS_AGENT_PLUGINS: messaging,openid4vc
+      OID4VC_ISSUER_ENABLED: "false"
+      OID4VC_HOLDER_ENABLED: "false"
+      OID4VC_VERIFIER_ENABLED: "true"
+      OID4VC_REQUEST_SIGNER: x5c
+      OID4VC_ISSUER_SIGNER: x5c
+      VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
+      UNFOLD_VCT: ${UNFOLD_VCT}
+      UNFOLD_VTJSC_ID: ${UNFOLD_VTJSC_ID}
+      ROGUE_VERIFIER_DID: ${ROGUE_VERIFIER_DID}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - verifier-afj:/root/.afj
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"Promise.all(['http://127.0.0.1:3000/v1/health', 'http://127.0.0.1:3001/oid4vc-demo/capabilities'].map((url) => fetch(url))).then((responses) => process.exit(responses.every((response) => response.ok) ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  issuer-afj:
+  holder-afj:
+  verifier-afj:

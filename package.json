@@ -5,6 +5,7 @@
   "packageManager": "pnpm@10.28.1",
   "scripts": {
     "setup": "tsx scripts/setup.ts",
+    "local:setup": "tsx scripts/setup-local-controlled.ts",
     "dev": "pnpm --parallel --filter @verana-playground/broker --filter @verana-playground/demo-app dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",

@@ -1,5 +1,6 @@
 .worktrees/
 .superpowers/
+# Disposable setup material, including generated local wallet keys and lifecycle state.
 .data/
 node_modules/
 dist/
