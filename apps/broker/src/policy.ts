@@ -11,33 +11,54 @@ const deniedVerdicts = [
 
 const verdictSchema = z.enum(["TRUSTED_AUTHORIZED", ...deniedVerdicts]);
 
+const nullableNonEmptyStringSchema = z
+  .string()
+  .min(1)
+  .refine((value) => value.trim().length > 0)
+  .nullable();
+
+const trustEvidenceSchema = z.strictObject({
+  did: nullableNonEmptyStringSchema,
+  trustStatus: z.enum(["TRUSTED", "PARTIAL", "UNTRUSTED"]).nullable(),
+  authorized: z.boolean().nullable(),
+  vtjscId: nullableNonEmptyStringSchema,
+  queries: z.array(z.string()),
+  note: z.string().optional(),
+});
+
 const receiptSchema = z.strictObject({
   state: z.literal("ResponseVerified"),
   receipt: z.strictObject({
     exchange: z.strictObject({
       protocol: z.literal("OID4VP 1.0"),
-      vct: z.string().min(1),
+      vct: nullableNonEmptyStringSchema,
       sessionId: z.string().min(1),
-      tenant: z.string().min(1),
+      tenant: z.enum(["trusted", "rogue"]),
       verifiedAt: z.string().datetime(),
     }),
     verifier: z.strictObject({
-      did: z.string().min(1),
+      did: nullableNonEmptyStringSchema,
       verdict: verdictSchema,
+      evidence: trustEvidenceSchema,
     }),
     issuer: z.strictObject({
-      did: z.string().min(1),
+      did: nullableNonEmptyStringSchema,
+      iss: nullableNonEmptyStringSchema,
       verdict: verdictSchema,
+      evidence: trustEvidenceSchema,
     }),
     credential: z.strictObject({
-      vct: z.string().min(1),
+      vct: nullableNonEmptyStringSchema,
       disclosedClaims: z.strictObject({
         subject_id: z.string().min(1).max(200),
-        organization: z.string(),
-        role: z.string(),
+        organization: z.unknown().optional(),
+        role: z.unknown().optional(),
       }),
     }),
     registry: z.strictObject({
+      network: z.literal("vna-testnet-1"),
+      trustRegistry: z.literal(184),
+      schema: z.literal(249),
       vtjscId: z.string().min(1),
     }),
   }),
@@ -72,7 +93,27 @@ export function authorizeReceipt(
     throw new Error("verifier_not_authorized");
   }
 
+  if (
+    !verifiedReceipt.verifier.did ||
+    verifiedReceipt.verifier.evidence.did !== verifiedReceipt.verifier.did ||
+    verifiedReceipt.verifier.evidence.vtjscId !== expected.vtjscId ||
+    verifiedReceipt.verifier.evidence.trustStatus !== "TRUSTED" ||
+    verifiedReceipt.verifier.evidence.authorized !== true
+  ) {
+    throw new Error("verifier_not_authorized");
+  }
+
   if (verifiedReceipt.issuer.verdict !== "TRUSTED_AUTHORIZED") {
+    throw new Error("issuer_not_authorized");
+  }
+
+  if (
+    !verifiedReceipt.issuer.did ||
+    verifiedReceipt.issuer.evidence.did !== verifiedReceipt.issuer.did ||
+    verifiedReceipt.issuer.evidence.vtjscId !== expected.vtjscId ||
+    verifiedReceipt.issuer.evidence.trustStatus !== "TRUSTED" ||
+    verifiedReceipt.issuer.evidence.authorized !== true
+  ) {
     throw new Error("issuer_not_authorized");
   }
 

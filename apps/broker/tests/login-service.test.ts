@@ -8,38 +8,11 @@ import {
 import { derivePairwiseSub } from "../src/pairwise-sub.js";
 import { TransactionStore } from "../src/transaction-store.js";
 import type { VsAgentClient, VsAgentSession } from "../src/vs-agent-client.js";
-
-const positiveSession = {
-  state: "ResponseVerified",
-  receipt: {
-    exchange: {
-      protocol: "OID4VP 1.0",
-      vct: "https://demo.example/vct",
-      sessionId: "vs-1",
-      tenant: "trusted",
-      verifiedAt: "2026-07-24T10:00:00.000Z",
-    },
-    verifier: {
-      did: "did:web:verifier.example",
-      verdict: "TRUSTED_AUTHORIZED",
-    },
-    issuer: {
-      did: "did:web:issuer.example",
-      verdict: "TRUSTED_AUTHORIZED",
-    },
-    credential: {
-      vct: "https://demo.example/vct",
-      disclosedClaims: {
-        subject_id: "user-1",
-        organization: "ACME",
-        role: "employee",
-      },
-    },
-    registry: {
-      vtjscId: "https://demo.example/schema",
-    },
-  },
-} satisfies VsAgentSession;
+import {
+  EXPECTED_VCT,
+  EXPECTED_VTJSC_ID,
+  positiveSession,
+} from "./fixtures/positive-receipt.js";
 
 class FakeAccountStore implements LoginAccountStore {
   readonly saved = new Map<string, LoginAccountClaims>();
@@ -70,8 +43,8 @@ function createService(getSession: () => Promise<VsAgentSession>): {
       vsAgentClient: client,
       transactionStore: transactions,
       accountStore: accounts,
-      expectedVct: "https://demo.example/vct",
-      expectedVtjscId: "https://demo.example/schema",
+      expectedVct: EXPECTED_VCT,
+      expectedVtjscId: EXPECTED_VTJSC_ID,
       sectorIdentifier: "verana-playground",
       pairwiseSubSecret: new Uint8Array(32).fill(7),
     }),
