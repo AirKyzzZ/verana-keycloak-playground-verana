@@ -111,6 +111,11 @@ separate Redis instances. Set the issuer/holder DID to one that the instance
 controls and that passes Q1 plus issuer Q2. Set the verifier DID to a different
 controlled DID that passes Q1 plus verifier Q3.
 
+The verifier base URL must also be different from both the issuer and holder
+base URLs after URL normalization. The issuer and holder may share one role
+instance. The live verifier rejects an aliased role topology before its first
+network request.
+
 Start each role in its own configured shell:
 
 ```bash
@@ -148,6 +153,18 @@ categories, and `PASS` or a sanitized `FAIL` code. A
 `FAIL BLOCKED_SUBJECT_CONTRACT` result is an honest blocked acceptance, not a
 passing login. Controlled fake services are used only by automated regression
 tests and never satisfy the live acceptance gate.
+
+Live responses are capped at 64 KiB and parsed against explicit field
+contracts. Resolver Q1 accepts only `did`, `trustStatus`, and `production`, plus
+the documented bounded `evaluatedAt`, `evaluatedAtBlock`, and `expiresAt`
+metadata. Q2/Q3 accepts only its authoritative fields plus the documented
+bounded `evaluatedAt`, `evaluatedAtBlock`, `fees`, `permission`, and
+`permissionChain` metadata. Capability, credential, holder, verifier, and
+receipt envelopes reject undocumented fields. OIDC discovery, the protocol
+credential-offer object, and SD-JWT `prettyClaims` are intentionally extensible
+objects; their keys, key counts, authoritative fields, and full response bodies
+remain bounded. Verified receipts are then parsed again by the broker's exact
+authorization schema.
 
 Browser verification may start only after the live script prints `PASS`. API
 tests do not prove the Keycloak JIT account flow, a physical wallet flow, or a

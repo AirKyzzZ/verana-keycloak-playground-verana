@@ -24,13 +24,18 @@ interface FakeBehavior {
     offerClaims: string[];
     disclosedClaims: string[];
   };
+  capabilityExtra?: boolean;
   failWithSensitiveBody?: boolean;
+  includeResolverMetadata?: boolean;
   issuerQ1Did?: string;
+  issuerQ1Extra?: boolean;
   issuerQ1Production?: boolean;
   issuerQ1TrustStatus?: string;
-  issuerQ2Authorized?: boolean;
+  issuerQ2Authorized?: unknown;
   issuerQ2Did?: string;
+  issuerQ2Extra?: boolean;
   issuerQ2Vtjsc?: string;
+  receiptExtra?: boolean;
   verifierQ1Did?: string;
   verifierQ1Production?: boolean;
   verifierQ1TrustStatus?: string;
@@ -43,6 +48,7 @@ interface FakeServices {
   baseUrl: string;
   close(): Promise<void>;
   issues: () => number;
+  requests: () => number;
   shares: () => number;
 }
 
@@ -55,12 +61,53 @@ afterEach(async () => {
 
 describe("local flow verification", () => {
   it.each([
+    [
+      "equal issuer and verifier DIDs",
+      (config: LocalFlowConfig) => ({
+        ...config,
+        expectedVerifierDid: config.expectedIssuerDid,
+      }),
+    ],
+    [
+      "verifier URL aliases issuer",
+      (config: LocalFlowConfig) => ({
+        ...config,
+        verifierBaseUrl: `${config.issuerBaseUrl}/`,
+      }),
+    ],
+    [
+      "verifier URL aliases holder",
+      (config: LocalFlowConfig) => ({
+        ...config,
+        verifierBaseUrl: `${config.holderBaseUrl}/`,
+      }),
+    ],
+  ])("blocks topology before any request for %s", async (_name, alter) => {
+    const services = await startFakeServices();
+    const lines: string[] = [];
+    const config = alter(flowConfig(services.baseUrl));
+
+    await expect(
+      runLocalFlow(config, {
+        sleep: async () => undefined,
+        write: (line) => lines.push(line),
+      }),
+    ).resolves.toBe(1);
+
+    expect(lines).toEqual(["FAIL BLOCKED_TOPOLOGY"]);
+    expect(lines.every((line) => line.length <= 80)).toBe(true);
+    expect(services.requests()).toBe(0);
+    expect(services.issues()).toBe(0);
+  });
+
+  it.each([
     ["issuer Q1 DID", { issuerQ1Did: "did:web:other.example" }],
     ["issuer Q1 trust", { issuerQ1TrustStatus: "PARTIAL" }],
     ["issuer Q1 production", { issuerQ1Production: false }],
     ["issuer Q2 DID", { issuerQ2Did: "did:web:other.example" }],
     ["issuer Q2 VTJSC", { issuerQ2Vtjsc: "https://other.example/schema" }],
     ["issuer Q2 authorization", { issuerQ2Authorized: false }],
+    ["issuer Q2 authorization type", { issuerQ2Authorized: "true" }],
     ["verifier Q1 DID", { verifierQ1Did: "did:web:other.example" }],
     ["verifier Q1 trust", { verifierQ1TrustStatus: "UNTRUSTED" }],
     ["verifier Q1 production", { verifierQ1Production: false }],
@@ -83,6 +130,44 @@ describe("local flow verification", () => {
       "FAIL BLOCKED_TRUST_PREFLIGHT",
     ]);
     expect(services.issues()).toBe(0);
+  });
+
+  it.each([
+    ["Q1", { issuerQ1Extra: true }, "BLOCKED_TRUST_PREFLIGHT"],
+    ["Q2", { issuerQ2Extra: true }, "BLOCKED_TRUST_PREFLIGHT"],
+    ["capability", { capabilityExtra: true }, "BLOCKED_SUBJECT_CONTRACT"],
+  ])(
+    "rejects an undocumented extra field in the %s contract",
+    async (_name, behavior, code) => {
+      const services = await startFakeServices(behavior);
+      const lines: string[] = [];
+
+      await expect(
+        runLocalFlow(flowConfig(services.baseUrl), {
+          sleep: async () => undefined,
+          write: (line) => lines.push(line),
+        }),
+      ).resolves.toBe(1);
+
+      expect(lines.at(-1)).toBe(`FAIL ${code}`);
+      expect(services.issues()).toBe(0);
+    },
+  );
+
+  it("accepts only the documented bounded resolver metadata", async () => {
+    const services = await startFakeServices({
+      includeResolverMetadata: true,
+    });
+    const lines: string[] = [];
+
+    await expect(
+      runLocalFlow(flowConfig(services.baseUrl), {
+        sleep: async () => undefined,
+        write: (line) => lines.push(line),
+      }),
+    ).resolves.toBe(0);
+
+    expect(lines.at(-1)).toBe("PASS");
   });
 
   it.each([
@@ -176,6 +261,20 @@ describe("local flow verification", () => {
     expect(lines.every((line) => line.length <= 80)).toBe(true);
     expect(lines.at(-1)).toBe("FAIL BLOCKED_TRUST_PREFLIGHT");
   });
+
+  it("rejects an extra field in the exact nested receipt", async () => {
+    const services = await startFakeServices({ receiptExtra: true });
+    const lines: string[] = [];
+
+    await expect(
+      runLocalFlow(flowConfig(services.baseUrl), {
+        sleep: async () => undefined,
+        write: (line) => lines.push(line),
+      }),
+    ).resolves.toBe(1);
+
+    expect(lines.at(-1)).toBe("FAIL FAIL_SMOKE");
+  });
 });
 
 function flowConfig(baseUrl: string): LocalFlowConfig {
@@ -202,6 +301,7 @@ async function startFakeServices(
   behavior: FakeBehavior = {},
 ): Promise<FakeServices> {
   let issueCount = 0;
+  let requestCount = 0;
   let shareCount = 0;
   let trustedRequestCount = 0;
   const capability = behavior.capability ?? {
@@ -211,6 +311,7 @@ async function startFakeServices(
   };
 
   const server = createServer(async (request, response) => {
+    requestCount += 1;
     if (behavior.failWithSensitiveBody && request.url?.startsWith("/trust/")) {
       json(response, 200, {
         detail: SENSITIVE_MARKER,
@@ -235,6 +336,16 @@ async function startFakeServices(
         production: issuer
           ? (behavior.issuerQ1Production ?? true)
           : (behavior.verifierQ1Production ?? true),
+        ...(behavior.includeResolverMetadata
+          ? {
+              evaluatedAt: "2026-07-24T17:38:31.649Z",
+              evaluatedAtBlock: 4_488_868,
+              expiresAt: "2026-07-24T18:38:31.649Z",
+            }
+          : {}),
+        ...(issuer && behavior.issuerQ1Extra
+          ? { undocumented: "reject-me" }
+          : {}),
       });
       return;
     }
@@ -243,6 +354,16 @@ async function startFakeServices(
         did: behavior.issuerQ2Did ?? did,
         vtjscId: behavior.issuerQ2Vtjsc ?? vtjscId,
         authorized: behavior.issuerQ2Authorized ?? true,
+        ...(behavior.includeResolverMetadata
+          ? {
+              evaluatedAt: "2026-07-24T17:46:35.631Z",
+              evaluatedAtBlock: {},
+              fees: {},
+              permission: {},
+              permissionChain: {},
+            }
+          : {}),
+        ...(behavior.issuerQ2Extra ? { undocumented: "reject-me" } : {}),
       });
       return;
     }
@@ -251,6 +372,15 @@ async function startFakeServices(
         did: behavior.verifierQ3Did ?? did,
         vtjscId: behavior.verifierQ3Vtjsc ?? vtjscId,
         authorized: behavior.verifierQ3Authorized ?? true,
+        ...(behavior.includeResolverMetadata
+          ? {
+              evaluatedAt: "2026-07-24T17:46:37.578Z",
+              evaluatedAtBlock: {},
+              fees: {},
+              permission: {},
+              permissionChain: {},
+            }
+          : {}),
       });
       return;
     }
@@ -260,7 +390,10 @@ async function startFakeServices(
         (prefix) => url.pathname === `${prefix}/oid4vc-demo/capabilities`,
       )
     ) {
-      json(response, 200, capability);
+      json(response, 200, {
+        ...capability,
+        ...(behavior.capabilityExtra ? { undocumented: "reject-me" } : {}),
+      });
       return;
     }
     if (
@@ -306,6 +439,7 @@ async function startFakeServices(
         id: "credential-1",
         vct: VCT,
         claims: {
+          vct: VCT,
           subject_id: SUBJECT,
           organization: "ACME",
           role: "employee",
@@ -373,7 +507,11 @@ async function startFakeServices(
       )
     ) {
       const sessionId = url.pathname.split("/").at(-1) ?? "";
-      json(response, 200, positiveSession(sessionId));
+      json(
+        response,
+        200,
+        positiveSession(sessionId, behavior.receiptExtra === true),
+      );
       return;
     }
 
@@ -391,13 +529,14 @@ async function startFakeServices(
       });
     },
     issues: () => issueCount,
+    requests: () => requestCount,
     shares: () => shareCount,
   };
   servers.add(service);
   return service;
 }
 
-function positiveSession(sessionId: string) {
+function positiveSession(sessionId: string, extra = false) {
   return {
     state: "ResponseVerified",
     receipt: {
@@ -445,6 +584,7 @@ function positiveSession(sessionId: string) {
         schema: 249,
         vtjscId: VTJSC,
       },
+      ...(extra ? { undocumented: "reject-me" } : {}),
     },
   };
 }

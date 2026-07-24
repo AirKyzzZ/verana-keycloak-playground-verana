@@ -21,19 +21,40 @@ acceptance. No fixture result is promoted to live evidence.
 
 | Command | Exit | Evidence |
 | --- | ---: | --- |
-| `pnpm vitest run tests/local-flow-verification.test.ts` | 0 | 17 controlled-service tests passed, including every Q1/Q2/Q3 condition, exact DID/VTJSC rejection, capability rejection before issuance, two stable trusted flows, rogue denial, and sanitized bounded output. |
+| `pnpm vitest run tests/local-flow-verification.test.ts` | 0 | 26 controlled-service tests passed, including topology rejection before all network activity, every Q1/Q2/Q3 condition, strict extra-field rejection, exact DID/VTJSC rejection, capability rejection before issuance, two stable trusted flows, rogue denial, and sanitized bounded output. |
 | `pnpm run setup` | 0 | Regenerated local secrets, broker key, and realm import state. |
 | `docker compose down` | 0 | Removed the previous local Keycloak container and network. |
 | `docker compose up -d keycloak` | 0 | Recreated pinned Keycloak 26.7.0 from the fresh realm state. |
 | `docker compose ps` | 0 | `auth-demo-keycloak-1` reported healthy. |
 | `docker compose config` | 0 | Rendered one loopback-bound Keycloak 26.7.0 service with the generated realm mounted read-only. |
-| `pnpm check` | 0 | Biome checked 49 files; both workspaces typechecked and built; 157 tests passed in 15 files. |
+| `pnpm check` | 0 | Biome checked 49 files; both workspaces typechecked and built; 166 tests passed in 15 files. |
 | `pnpm exec tsc --noEmit --target ES2024 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck scripts/verify-local-flow.ts tests/local-flow-verification.test.ts` | 0 | Standalone script and focused test TypeScript check passed. |
 | `pnpm tsx scripts/verify-keycloak.ts` | 0 | Realm, Authorization Code with S256, IdP, broker signature/secret behavior, JIT-only first login, exact mappers, authorization targets, and zero pre-created users passed. |
 | `pnpm tsx scripts/verify-local-flow.ts` | 1 | Live resolver checks passed, then acceptance stopped with `FAIL BLOCKED_SUBJECT_CONTRACT` before credential issuance. |
-| read-only public capability probes | 0 | Both currently deployed issuer and verifier `/oid4vc-demo/capabilities` endpoints returned HTTP 404. |
+| bounded read-only issuer capability probe below | 0 | The currently deployed issuer endpoint returned HTTP `404`. |
+| bounded read-only verifier capability probe below | 0 | The currently deployed verifier endpoint returned HTTP `404`. |
 | `git diff --check` | 0 | No patch whitespace errors. |
 | `git status --short` | 0 | Before commit, only `.env.example`, `README.md`, `docs/evidence/README.md`, `scripts/verify-local-flow.ts`, and `tests/local-flow-verification.test.ts` were changed or untracked. |
+
+The exact reproducible capability probes were:
+
+```bash
+curl --max-time 10 --max-filesize 1024 --silent --show-error \
+  --output /dev/null --write-out '%{http_code}\n' \
+  'https://unfold-org.77.42.86.24.sslip.io/oid4vc-demo/capabilities'
+# output: 404
+# exit: 0
+
+curl --max-time 10 --max-filesize 1024 --silent --show-error \
+  --output /dev/null --write-out '%{http_code}\n' \
+  'https://unfold-verifier.77.42.86.24.sslip.io/oid4vc-demo/capabilities'
+# output: 404
+# exit: 0
+```
+
+The HTTP 404 is observed evidence, while curl exits 0 because the probe
+intentionally records the HTTP status without `--fail`. The live acceptance
+command remains a separate non-zero result.
 
 ## Verdicts
 
