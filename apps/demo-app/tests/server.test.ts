@@ -263,6 +263,16 @@ describe("OIDC application routes", () => {
     expect(response.text).toContain("employee");
   });
 
+  it("renders a random server-bound CSRF token in the authenticated logout form", async () => {
+    const { agent } = await login();
+
+    const response = await agent.get("/profile").expect(200);
+    const token = csrfToken(response);
+
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(response.text.match(/name="csrfToken"/g)).toHaveLength(1);
+  });
+
   it.each([
     {
       name: "Verana subject",
@@ -320,10 +330,66 @@ describe("OIDC application routes", () => {
     expect(cookie).not.toContain("pairwise-subject-123");
   });
 
-  it("logout destroys local state and expires the cookie", async () => {
+  it("cross-port forced logout is rejected without terminating the session", async () => {
     const { agent } = await login();
+    const token = csrfToken(await agent.get("/profile").expect(200));
 
-    const response = await agent.post("/logout").expect(302);
+    const response = await agent
+      .post("/logout")
+      .set("Origin", "http://localhost:9999")
+      .type("form")
+      .send({ csrfToken: token })
+      .expect(403);
+
+    expect(response.text).toContain("Invalid logout request");
+    await agent.get("/profile").expect(200);
+  });
+
+  it.each([
+    { name: "missing Origin", origin: undefined, submittedToken: "valid" },
+    { name: "null Origin", origin: "null", submittedToken: "valid" },
+    {
+      name: "wrong Origin",
+      origin: "http://localhost:4000",
+      submittedToken: "valid",
+    },
+    { name: "missing token", origin: APP_ORIGIN, submittedToken: undefined },
+    { name: "null token", origin: APP_ORIGIN, submittedToken: "null" },
+    {
+      name: "wrong token",
+      origin: APP_ORIGIN,
+      submittedToken: "wrong-csrf-token",
+    },
+  ])(
+    "rejects logout with $name without terminating the session",
+    async ({ origin, submittedToken }) => {
+      const { agent } = await login();
+      const validToken = csrfToken(await agent.get("/profile").expect(200));
+      const mutation = agent.post("/logout").type("form");
+      if (origin) mutation.set("Origin", origin);
+      if (submittedToken) {
+        mutation.send({
+          csrfToken: submittedToken === "valid" ? validToken : submittedToken,
+        });
+      }
+
+      const response = await mutation.expect(403);
+
+      expect(response.text).toContain("Invalid logout request");
+      await agent.get("/profile").expect(200);
+    },
+  );
+
+  it("valid logout destroys local state and expires the cookie", async () => {
+    const { agent } = await login();
+    const token = csrfToken(await agent.get("/profile").expect(200));
+
+    const response = await agent
+      .post("/logout")
+      .set("Origin", APP_ORIGIN)
+      .type("form")
+      .send({ csrfToken: token })
+      .expect(302);
 
     expect(cookieValue(response, "verana_session")).toContain("expires=");
     await agent.get("/profile").expect(401);
@@ -461,6 +527,7 @@ describe("local-holder routes", () => {
     expect(options.walletClient.share).toHaveBeenCalledWith(positiveResolution);
     expect(response.text).toContain("Presentation shared");
     expect(response.text).not.toContain("Share approved claims");
+    expect(response.text).not.toContain("Sharing refused");
   });
 
   it.each([

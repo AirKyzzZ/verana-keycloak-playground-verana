@@ -39,6 +39,11 @@ interface WalletAccess {
   workflow: WalletWorkflow;
 }
 
+interface AuthenticatedSession {
+  csrfToken: string;
+  identity: KeycloakIdentity;
+}
+
 export interface DemoServerOptions {
   config: DemoConfig;
   keycloakClient: KeycloakClientContract;
@@ -55,7 +60,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
     "authorization",
     { maxEntries: AUTH_MAX_ENTRIES, ttlMs: AUTH_TTL_MS },
   );
-  const sessionStore = new OpaqueStore<KeycloakIdentity>(
+  const sessionStore = new OpaqueStore<AuthenticatedSession>(
     config.SESSION_SECRET,
     "session",
     { maxEntries: SESSION_MAX_ENTRIES, ttlMs: SESSION_TTL_MS },
@@ -126,7 +131,10 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       ) {
         throw new Error("identity_binding_invalid");
       }
-      const sessionToken = sessionStore.create(identity);
+      const sessionToken = sessionStore.create({
+        csrfToken: randomOpaqueValue(),
+        identity,
+      });
       setOpaqueCookie(
         context,
         SESSION_COOKIE,
@@ -149,8 +157,8 @@ export function createDemoServer(options: DemoServerOptions): Koa {
 
   router.get("/profile", (context) => {
     const sessionToken = context.cookies.get(SESSION_COOKIE);
-    const identity = sessionToken ? sessionStore.get(sessionToken) : undefined;
-    if (!identity) {
+    const session = sessionToken ? sessionStore.get(sessionToken) : undefined;
+    if (!session) {
       html(
         context,
         401,
@@ -158,7 +166,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       );
       return;
     }
-    const authorized = authorizedProfile(identity);
+    const authorized = authorizedProfile(session.identity);
     if (!authorized) {
       html(
         context,
@@ -170,12 +178,31 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       );
       return;
     }
-    html(context, 200, renderProfilePage(authorized));
+    html(context, 200, renderProfilePage(authorized, session.csrfToken));
   });
 
   router.post("/logout", (context) => {
     const sessionToken = context.cookies.get(SESSION_COOKIE);
-    if (sessionToken) sessionStore.delete(sessionToken);
+    const session = sessionToken ? sessionStore.get(sessionToken) : undefined;
+    const submittedToken = formString(context, "csrfToken", 100);
+    if (
+      context.get("Origin") !== expectedOrigin ||
+      !sessionToken ||
+      !session ||
+      !submittedToken ||
+      !tokensEqual(session.csrfToken, submittedToken)
+    ) {
+      html(
+        context,
+        403,
+        renderErrorPage(
+          "Invalid logout request",
+          "Reload the protected profile before trying again.",
+        ),
+      );
+      return;
+    }
+    sessionStore.delete(sessionToken);
     clearCookie(context, SESSION_COOKIE, secureCookies);
     context.redirect("/");
   });

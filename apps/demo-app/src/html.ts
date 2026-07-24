@@ -56,6 +56,7 @@ export function renderHomePage(): string {
 
 export function renderProfilePage(
   identity: KeycloakIdentity & { veranaSubject: string },
+  csrfToken: string,
 ): string {
   return renderDocument(
     "Protected profile",
@@ -74,6 +75,7 @@ export function renderProfilePage(
         <dd>${escapeHtml("employee")}</dd>
       </dl>
       <form method="post" action="/logout">
+        <input type="hidden" name="csrfToken" value="${escapeHtml(csrfToken)}">
         <button type="submit">Log out locally</button>
       </form>
     `,
@@ -167,15 +169,16 @@ function renderResolution(
     .map((claim) => `<li><code>${escapeHtml(claim)}</code></li>`)
     .join("");
   const verdictClass = positive ? "success" : "error";
-  const action =
-    positive && canShare
+  const action = !positive
+    ? `<p class="error">Sharing refused. The verifier is not both trusted and authorized.</p>`
+    : canShare
       ? `
         <form method="post" action="/wallet/share">
           ${csrfField}
           <button type="submit">Share approved claims</button>
         </form>
       `
-      : `<p class="error">Sharing refused. The verifier is not both trusted and authorized.</p>`;
+      : "";
 
   return `
     <section class="result">
