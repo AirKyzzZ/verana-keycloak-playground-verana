@@ -76,7 +76,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
   app.use(async (context, next) => {
     context.set("Cache-Control", "no-store");
     context.set("X-Content-Type-Options", "nosniff");
-    context.set("Referrer-Policy", "no-referrer");
+    context.set("Referrer-Policy", "same-origin");
     context.set(
       "Content-Security-Policy",
       "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",

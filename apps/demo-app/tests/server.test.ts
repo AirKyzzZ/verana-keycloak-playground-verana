@@ -172,6 +172,14 @@ async function login(options = createOptions()): Promise<{
 }
 
 describe("OIDC application routes", () => {
+  it("uses same-origin referrer policy so Chrome preserves the exact Origin required by CSRF checks", async () => {
+    const response = await request(createDemoServer(createOptions()).callback())
+      .get("/")
+      .expect(200);
+
+    expect(response.headers["referrer-policy"]).toBe("same-origin");
+  });
+
   it("/login stores an opaque transaction and sets an HttpOnly SameSite=Lax cookie", async () => {
     const options = createOptions();
     const response = await request(createDemoServer(options).callback())
