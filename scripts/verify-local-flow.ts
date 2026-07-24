@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 
 import { derivePairwiseSub } from "../apps/broker/src/pairwise-sub.js";
 import { authorizeReceipt } from "../apps/broker/src/policy.js";
+import { assertKeycloakUserCount } from "./keycloak-verification.js";
+import { LOCAL_CONTROLLED } from "./local-controlled-config.js";
 
 const MAX_RESPONSE_BYTES = 64 * 1_024;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -10,7 +12,8 @@ const COMPONENT_ATTEMPTS = 10;
 const COMPONENT_RETRY_MS = 500;
 const PRESENTATION_ATTEMPTS = 20;
 const PRESENTATION_RETRY_MS = 500;
-const SUBJECT_ID = "call-demo-user";
+const LIVE_SUBJECT_ID = "call-demo-user";
+const CONTROLLED_SUBJECT_ID = "local-controlled-user";
 const DEFAULT_RESOLVER_URL = "https://resolver.testnet.verana.network/v1/trust";
 const DEFAULT_ISSUER_DID =
   "did:webvh:QmPjKbgpLykjtHGTUfVRNoHra94mjitQsFniXYCTgmNYzG:unfold-org.77.42.86.24.sslip.io";
@@ -34,6 +37,7 @@ const DENIED_VERDICTS = [
 
 type TrustStatus = "TRUSTED" | "PARTIAL" | "UNTRUSTED";
 type Verdict = "TRUSTED_AUTHORIZED" | (typeof DENIED_VERDICTS)[number];
+export type EvidenceMode = "LIVE_VERANA" | "LOCAL_CONTROLLED";
 
 interface StrictSchema<T> {
   parse(value: unknown): T;
@@ -52,7 +56,18 @@ interface AuthorizationResponse {
 }
 
 interface Resolution {
+  evidence: {
+    authorized: boolean | null;
+    did: string | null;
+    trustStatus: TrustStatus | null;
+    vtjscId: string | null;
+  };
   gateId: string;
+  request: {
+    requestedClaims: string[];
+    requestedVct: string | null;
+    verifierDid: string | null;
+  };
   verdict: Verdict;
 }
 
@@ -74,6 +89,8 @@ const presentationStatusSchema = schema(parsePresentationStatus);
 
 type FailureCode =
   | "BLOCKED_COMPONENT"
+  | "BLOCKED_CONTROLLED_CONFIG"
+  | "BLOCKED_KEYCLOAK_STATE"
   | "BLOCKED_SUBJECT_CONTRACT"
   | "BLOCKED_TOPOLOGY"
   | "BLOCKED_TRUST_PREFLIGHT"
@@ -88,6 +105,7 @@ class FlowFailure extends Error {
 export interface LocalFlowConfig {
   brokerIssuer: string;
   demoAppBaseUrl: string;
+  evidenceMode: EvidenceMode;
   expectedIssuerDid: string;
   expectedVerifierDid: string;
   expectedVct: string;
@@ -108,10 +126,21 @@ interface LocalFlowDependencies {
 }
 
 interface PresentationIdentity {
+  authorizationRequest: string;
+  credentialId: string;
+  credentialSubject: string;
   issuerDid: string;
+  issuanceSessionId: string;
   pairwiseSubject: string;
+  sessionId: string;
   subjectId: string;
   verifierDid: string;
+}
+
+interface AcceptedCredential {
+  credentialId: string;
+  issuanceSessionId: string;
+  subjectId: string;
 }
 
 export async function runLocalFlow(
@@ -121,9 +150,17 @@ export async function runLocalFlow(
   const fetchImpl = dependencies.fetch ?? fetch;
   const sleep = dependencies.sleep ?? defaultSleep;
   const write = dependencies.write ?? console.log;
+  let controlledUserCountMeasured = false;
 
   try {
+    verifyControlledConfig(config);
     verifyTopology(config);
+
+    if (config.evidenceMode === "LOCAL_CONTROLLED") {
+      await assertControlledKeycloakUserCount(config, fetchImpl);
+      controlledUserCountMeasured = true;
+      write("KEYCLOAK USERS 0");
+    }
 
     write("STAGE TRUST_PREFLIGHT");
     await verifyTrustPreflight(config, fetchImpl);
@@ -136,36 +173,82 @@ export async function runLocalFlow(
     write("STAGE COMPONENT_READINESS");
     await verifyComponentReadiness(config, fetchImpl, sleep);
 
-    write("STAGE CREDENTIAL");
-    await createAndAcceptBadge(config, fetchImpl);
-
+    write(
+      config.evidenceMode === "LOCAL_CONTROLLED"
+        ? "STAGE CREDENTIAL_1"
+        : "STAGE CREDENTIAL",
+    );
+    const firstCredential = await createAndAcceptBadge(config, fetchImpl);
     write("STAGE PRESENTATION_1");
-    const first = await runTrustedPresentation(config, fetchImpl, sleep);
+    const first = await runTrustedPresentation(
+      config,
+      firstCredential,
+      fetchImpl,
+      sleep,
+    );
     write("VERDICT PRESENTATION_1_ISSUER TRUSTED_AUTHORIZED");
     write("VERDICT PRESENTATION_1_VERIFIER TRUSTED_AUTHORIZED");
 
+    let secondCredential = firstCredential;
+    if (config.evidenceMode === "LOCAL_CONTROLLED") {
+      write("STAGE CREDENTIAL_2");
+      secondCredential = await createAndAcceptBadge(config, fetchImpl);
+    }
     write("STAGE PRESENTATION_2");
-    const second = await runTrustedPresentation(config, fetchImpl, sleep);
+    const second = await runTrustedPresentation(
+      config,
+      secondCredential,
+      fetchImpl,
+      sleep,
+      first,
+    );
     write("VERDICT PRESENTATION_2_ISSUER TRUSTED_AUTHORIZED");
     write("VERDICT PRESENTATION_2_VERIFIER TRUSTED_AUTHORIZED");
 
     if (
+      first.credentialSubject !== second.credentialSubject ||
       first.subjectId !== second.subjectId ||
       first.issuerDid !== second.issuerDid ||
       first.verifierDid !== second.verifierDid ||
-      first.pairwiseSubject !== second.pairwiseSubject
+      first.pairwiseSubject !== second.pairwiseSubject ||
+      (config.evidenceMode === "LOCAL_CONTROLLED" &&
+        (first.credentialId === second.credentialId ||
+          first.issuanceSessionId === second.issuanceSessionId))
     ) {
       throw new FlowFailure("FAIL_SMOKE");
     }
     write("VERDICT SUBJECT STABLE");
 
+    if (config.evidenceMode === "LOCAL_CONTROLLED") {
+      await assertControlledKeycloakUserCount(config, fetchImpl);
+      write("KEYCLOAK USERS 0");
+    }
+
     write("STAGE ROGUE_PRESENTATION");
     await assertRoguePresentationDenied(config, fetchImpl);
     write("VERDICT ROGUE DENIED");
-    write("PASS");
+
+    if (config.evidenceMode === "LOCAL_CONTROLLED") {
+      await assertControlledKeycloakUserCount(config, fetchImpl);
+      write("KEYCLOAK USERS 0");
+    }
+
+    write(
+      config.evidenceMode === "LOCAL_CONTROLLED"
+        ? "PASS LOCAL_CONTROLLED"
+        : "PASS",
+    );
     return 0;
   } catch (error) {
-    write(`FAIL ${safeFailureCode(error)}`);
+    let failure = error;
+    if (controlledUserCountMeasured) {
+      try {
+        await assertControlledKeycloakUserCount(config, fetchImpl);
+      } catch {
+        failure = new FlowFailure("BLOCKED_KEYCLOAK_STATE");
+      }
+    }
+    write(`FAIL ${safeFailureCode(failure)}`);
     return 1;
   }
 }
@@ -187,6 +270,56 @@ function verifyTopology(config: LocalFlowConfig): void {
   }
 }
 
+function verifyControlledConfig(config: LocalFlowConfig): void {
+  if (config.evidenceMode !== "LOCAL_CONTROLLED") return;
+  try {
+    const exactValues = [
+      [config.brokerIssuer, "http://localhost:3001"],
+      [config.demoAppBaseUrl, "http://localhost:3000"],
+      [config.expectedIssuerDid, LOCAL_CONTROLLED.issuerDid],
+      [config.expectedVerifierDid, LOCAL_CONTROLLED.verifierDid],
+      [config.expectedVct, LOCAL_CONTROLLED.vct],
+      [config.expectedVtjscId, LOCAL_CONTROLLED.vtjscId],
+      [config.holderBaseUrl, "http://localhost:3111"],
+      [config.issuerBaseUrl, "http://localhost:3101"],
+      [config.keycloakIssuer, "http://localhost:8080/realms/verana-playground"],
+      [config.resolverUrl, "http://localhost:3099/v1/trust"],
+      [config.verifierBaseUrl, "http://localhost:3201"],
+    ] as const;
+    if (exactValues.some(([actual, expected]) => actual !== expected)) {
+      throw new Error("controlled_config_mismatch");
+    }
+    const agentOrigins = new Set(
+      [config.issuerBaseUrl, config.holderBaseUrl, config.verifierBaseUrl].map(
+        (value) => new URL(value).origin,
+      ),
+    );
+    if (agentOrigins.size !== 3) throw new Error("controlled_agent_alias");
+  } catch {
+    throw new FlowFailure("BLOCKED_CONTROLLED_CONFIG");
+  }
+}
+
+async function assertControlledKeycloakUserCount(
+  config: LocalFlowConfig,
+  fetchImpl: typeof fetch,
+): Promise<void> {
+  try {
+    await assertKeycloakUserCount(0, {
+      baseUrl: new URL(config.keycloakIssuer).origin,
+      fetch: fetchImpl,
+    });
+  } catch {
+    throw new FlowFailure("BLOCKED_KEYCLOAK_STATE");
+  }
+}
+
+function subjectIdFor(config: LocalFlowConfig): string {
+  return config.evidenceMode === "LOCAL_CONTROLLED"
+    ? CONTROLLED_SUBJECT_ID
+    : LIVE_SUBJECT_ID;
+}
+
 export function loadLocalFlowConfig(
   environment: NodeJS.ProcessEnv = process.env,
 ): LocalFlowConfig {
@@ -198,6 +331,7 @@ export function loadLocalFlowConfig(
     demoAppBaseUrl:
       environment.DEMO_APP_BASE_URL ??
       demoOrigin(environment.DEMO_APP_REDIRECT_URI),
+    evidenceMode: parseEvidenceMode(environment.EVIDENCE_MODE),
     expectedIssuerDid: environment.EXPECTED_ISSUER_DID ?? DEFAULT_ISSUER_DID,
     expectedVerifierDid:
       environment.EXPECTED_VERIFIER_DID ?? DEFAULT_VERIFIER_DID,
@@ -361,12 +495,13 @@ async function verifyComponentReadiness(
 async function createAndAcceptBadge(
   config: LocalFlowConfig,
   fetchImpl: typeof fetch,
-): Promise<void> {
+): Promise<AcceptedCredential> {
   try {
+    const subjectId = subjectIdFor(config);
     const offer = await requestJson(
       `${normalizeBaseUrl(config.issuerBaseUrl)}/oid4vc-demo/offers`,
       jsonRequest({
-        subjectId: SUBJECT_ID,
+        subjectId,
         organization: "ACME",
         role: "employee",
       }),
@@ -383,10 +518,15 @@ async function createAndAcceptBadge(
     );
     if (
       accepted.vct !== config.expectedVct ||
-      accepted.claims.subject_id !== SUBJECT_ID
+      accepted.claims.subject_id !== subjectId
     ) {
       throw new Error("credential_mismatch");
     }
+    return {
+      credentialId: accepted.id,
+      issuanceSessionId: offer.issuanceSessionId,
+      subjectId: accepted.claims.subject_id,
+    };
   } catch {
     throw new FlowFailure("FAIL_SMOKE");
   }
@@ -394,8 +534,10 @@ async function createAndAcceptBadge(
 
 async function runTrustedPresentation(
   config: LocalFlowConfig,
+  credential: AcceptedCredential,
   fetchImpl: typeof fetch,
   sleep: (milliseconds: number) => Promise<void>,
+  previous?: PresentationIdentity,
 ): Promise<PresentationIdentity> {
   try {
     const request = await createPresentationRequest(
@@ -403,13 +545,33 @@ async function runTrustedPresentation(
       fetchImpl,
       "trusted",
     );
+    if (
+      previous &&
+      (request.authorizationRequest === previous.authorizationRequest ||
+        request.sessionId === previous.sessionId)
+    ) {
+      throw new Error("presentation_replay");
+    }
     const resolution = await requestJson(
       `${normalizeBaseUrl(config.holderBaseUrl)}/oid4vc-demo/wallet/resolve-request`,
       jsonRequest({ authorizationRequest: request.authorizationRequest }),
       fetchImpl,
       resolutionSchema,
     );
-    if (resolution.verdict !== "TRUSTED_AUTHORIZED") {
+    if (
+      resolution.verdict !== "TRUSTED_AUTHORIZED" ||
+      resolution.evidence.did !== config.expectedVerifierDid ||
+      resolution.evidence.trustStatus !== "TRUSTED" ||
+      resolution.evidence.authorized !== true ||
+      resolution.evidence.vtjscId !== config.expectedVtjscId ||
+      resolution.request.verifierDid !== config.expectedVerifierDid ||
+      resolution.request.requestedVct !== config.expectedVct ||
+      !exactStrings(resolution.request.requestedClaims, [
+        "subject_id",
+        "organization",
+        "role",
+      ])
+    ) {
       throw new Error("holder_denied");
     }
     const gateId = resolution.gateId;
@@ -435,18 +597,24 @@ async function runTrustedPresentation(
     if (
       identity.issuerDid !== config.expectedIssuerDid ||
       identity.verifierDid !== config.expectedVerifierDid ||
-      identity.subjectId !== SUBJECT_ID
+      identity.subjectId !== credential.subjectId ||
+      identity.subjectId !== subjectIdFor(config)
     ) {
       throw new Error("receipt_identity_mismatch");
     }
     return {
+      authorizationRequest: request.authorizationRequest,
+      credentialId: credential.credentialId,
+      credentialSubject: credential.subjectId,
       issuerDid: identity.issuerDid,
+      issuanceSessionId: credential.issuanceSessionId,
       pairwiseSubject: derivePairwiseSub({
         issuerDid: identity.issuerDid,
         sectorIdentifier: config.sectorIdentifier,
         secret: config.pairwiseSubSecret,
         subjectId: identity.subjectId,
       }),
+      sessionId: request.sessionId,
       subjectId: identity.subjectId,
       verifierDid: identity.verifierDid,
     };
@@ -525,7 +693,9 @@ async function requestJson<T>(
   }
   const bytes = await readBoundedBody(response);
   return responseSchema.parse(
-    JSON.parse(new TextDecoder().decode(bytes)) as unknown,
+    JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    ) as unknown,
   );
 }
 
@@ -752,7 +922,7 @@ function parseResolution(value: unknown): Resolution {
     "request",
     "verdict",
   ]);
-  parseEvidence(response.evidence);
+  const evidence = parseEvidence(response.evidence);
   const request = strictRecord(response.request, [
     "clientId",
     "clientIdPrefix",
@@ -762,20 +932,28 @@ function parseResolution(value: unknown): Resolution {
   ]);
   boundedString(request.clientId, MAX_URL_LENGTH);
   boundedString(request.clientIdPrefix, MAX_IDENTIFIER_LENGTH);
-  nullableBoundedString(request.verifierDid, MAX_URL_LENGTH);
-  nullableBoundedString(request.requestedVct, MAX_URL_LENGTH);
-  boundedStringArray(
+  const verifierDid = nullableBoundedString(
+    request.verifierDid,
+    MAX_URL_LENGTH,
+  );
+  const requestedVct = nullableBoundedString(
+    request.requestedVct,
+    MAX_URL_LENGTH,
+  );
+  const requestedClaims = boundedStringArray(
     request.requestedClaims,
     MAX_COLLECTION_ITEMS,
     MAX_IDENTIFIER_LENGTH,
   );
   return {
+    evidence,
     gateId: boundedString(response.gateId, MAX_IDENTIFIER_LENGTH),
+    request: { requestedClaims, requestedVct, verifierDid },
     verdict: verdict(response.verdict),
   };
 }
 
-function parseEvidence(value: unknown): void {
+function parseEvidence(value: unknown): Resolution["evidence"] {
   const evidence = strictRecord(value, [
     "authorized",
     "did",
@@ -784,12 +962,13 @@ function parseEvidence(value: unknown): void {
     "trustStatus",
     "vtjscId",
   ]);
-  nullableBoundedString(evidence.did, MAX_URL_LENGTH);
-  nullableTrustStatus(evidence.trustStatus);
-  nullableBoolean(evidence.authorized);
-  nullableBoundedString(evidence.vtjscId, MAX_URL_LENGTH);
+  const did = nullableBoundedString(evidence.did, MAX_URL_LENGTH);
+  const trustStatus = nullableTrustStatus(evidence.trustStatus);
+  const authorized = nullableBoolean(evidence.authorized);
+  const vtjscId = nullableBoundedString(evidence.vtjscId, MAX_URL_LENGTH);
   boundedStringArray(evidence.queries, MAX_COLLECTION_ITEMS, MAX_URL_LENGTH);
   if (evidence.note !== undefined) boundedString(evidence.note, 500);
+  return { authorized, did, trustStatus, vtjscId };
 }
 
 function parseShared(value: unknown): { shared: true; status: number } {
@@ -928,11 +1107,22 @@ function boundedStringArray(
   value: unknown,
   maximumItems: number,
   maximumLength: number,
-): void {
+): string[] {
   if (!Array.isArray(value) || value.length > maximumItems) {
     throw new Error("schema_invalid");
   }
   for (const item of value) boundedString(item, maximumLength);
+  return value as string[];
+}
+
+function exactStrings(
+  actual: readonly string[],
+  expected: readonly string[],
+): boolean {
+  return (
+    actual.length === expected.length &&
+    actual.every((value, index) => value === expected[index])
+  );
 }
 
 function validateOptionalTimestamp(value: unknown): void {
@@ -1017,6 +1207,12 @@ function canonicalBaseUrl(value: string): string {
 
 function demoOrigin(redirectUri: string | undefined): string {
   return redirectUri ? new URL(redirectUri).origin : "http://localhost:3000";
+}
+
+function parseEvidenceMode(value: string | undefined): EvidenceMode {
+  if (value === undefined || value === "LIVE_VERANA") return "LIVE_VERANA";
+  if (value === "LOCAL_CONTROLLED") return value;
+  throw new FlowFailure("BLOCKED_COMPONENT");
 }
 
 function parseLocalSecrets(value: string): Map<string, string> {

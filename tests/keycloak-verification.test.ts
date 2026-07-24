@@ -1,15 +1,31 @@
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   assertClientSecretPost,
   assertExactNames,
+  assertKeycloakUserCount,
   assertSecretMatch,
   parseLocalSecrets,
+  readKeycloakUsers,
 } from "../scripts/keycloak-verification.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const servers = new Set<ReturnType<typeof createServer>>();
+
+afterEach(async () => {
+  await Promise.all(
+    [...servers].map(
+      (server) =>
+        new Promise<void>((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        }),
+    ),
+  );
+  servers.clear();
+});
 
 describe("Keycloak verification helpers", () => {
   it("rejects extra configured names with a static error", () => {
@@ -152,4 +168,176 @@ describe("Keycloak verification helpers", () => {
       source.match(/await fetchForIdentityProviderProbe\(/g)?.length ?? 0,
     ).toBe(3);
   });
+
+  it("reads only bounded Keycloak user summaries", async () => {
+    const keycloak = await startKeycloakFixture([
+      {
+        id: "user-1",
+        username: "pairwise-user",
+        attributes: {
+          verana_subject: ["stable-pairwise-subject"],
+          ignored_private_attribute: ["must-not-leak"],
+        },
+        credentials: [{ id: "credential-1", value: "must-not-leak" }],
+      },
+    ]);
+
+    await expect(
+      readKeycloakUsers({ baseUrl: keycloak.baseUrl }),
+    ).resolves.toEqual([
+      {
+        id: "user-1",
+        username: "pairwise-user",
+        veranaSubject: "stable-pairwise-subject",
+        groups: ["/organizations/acme"],
+        roles: ["employee"],
+      },
+    ]);
+
+    expect(keycloak.authorizationHeaders()).toEqual([
+      "Bearer bounded-admin-token",
+      "Bearer bounded-admin-token",
+      "Bearer bounded-admin-token",
+    ]);
+  });
+
+  it("asserts the exact Keycloak user count without returning admin material", async () => {
+    const keycloak = await startKeycloakFixture([]);
+
+    await expect(
+      assertKeycloakUserCount(0, { baseUrl: keycloak.baseUrl }),
+    ).resolves.toEqual([]);
+    await expect(
+      assertKeycloakUserCount(1, { baseUrl: keycloak.baseUrl }),
+    ).rejects.toThrowError("Keycloak user count mismatch");
+  });
+
+  it("rejects malformed Keycloak user attributes without leaking token bodies", async () => {
+    const keycloak = await startKeycloakFixture([
+      {
+        id: "user-1",
+        username: "pairwise-user",
+        attributes: {
+          verana_subject: ["first", "second"],
+        },
+      },
+    ]);
+    let failure: unknown;
+
+    try {
+      await readKeycloakUsers({ baseUrl: keycloak.baseUrl });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure instanceof Error && failure.message).toBe(
+      "Keycloak user response is invalid",
+    );
+    expect(JSON.stringify(failure)).not.toContain("bounded-admin-token");
+    expect(JSON.stringify(failure)).not.toContain("first");
+  });
 });
+
+interface KeycloakFixture {
+  authorizationHeaders(): string[];
+  baseUrl: string;
+}
+
+async function startKeycloakFixture(
+  users: ReadonlyArray<Record<string, unknown>>,
+): Promise<KeycloakFixture> {
+  const authorizationHeaders: string[] = [];
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (
+      request.method === "POST" &&
+      url.pathname === "/realms/master/protocol/openid-connect/token"
+    ) {
+      response.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify({
+          access_token: "bounded-admin-token",
+          expires_in: 60,
+          refresh_expires_in: 0,
+          token_type: "Bearer",
+          "not-before-policy": 0,
+          scope: "profile email",
+        }),
+      );
+      return;
+    }
+
+    const authorization = request.headers.authorization;
+    if (authorization) authorizationHeaders.push(authorization);
+    if (
+      authorization !== "Bearer bounded-admin-token" ||
+      request.method !== "GET"
+    ) {
+      response
+        .writeHead(401, { "content-type": "application/json" })
+        .end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+
+    if (url.pathname === "/admin/realms/verana-playground/users") {
+      response
+        .writeHead(200, { "content-type": "application/json" })
+        .end(JSON.stringify(users));
+      return;
+    }
+
+    const groupsMatch = url.pathname.match(
+      /^\/admin\/realms\/verana-playground\/users\/([^/]+)\/groups$/,
+    );
+    if (groupsMatch) {
+      response.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify([
+          {
+            id: "group-1",
+            name: "acme",
+            path: "/organizations/acme",
+            subGroupCount: 0,
+            subGroups: [],
+          },
+        ]),
+      );
+      return;
+    }
+
+    const rolesMatch = url.pathname.match(
+      /^\/admin\/realms\/verana-playground\/users\/([^/]+)\/role-mappings\/realm\/composite$/,
+    );
+    if (rolesMatch) {
+      response.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify([
+          {
+            id: "role-1",
+            name: "employee",
+            description: "Employee",
+            composite: false,
+            clientRole: false,
+            containerId: "verana-playground",
+          },
+        ]),
+      );
+      return;
+    }
+
+    response
+      .writeHead(404, { "content-type": "application/json" })
+      .end(JSON.stringify({ error: "not_found" }));
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  servers.add(server);
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Keycloak fixture has no TCP address");
+  }
+  return {
+    authorizationHeaders: () => authorizationHeaders,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+  };
+}
