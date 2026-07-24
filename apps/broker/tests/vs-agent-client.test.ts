@@ -163,6 +163,57 @@ describe("VsAgentClient", () => {
     },
   );
 
+  it("rejects a non-JSON content type even when the request response is valid JSON", async () => {
+    const sensitiveMarker = "sensitive-mislabeled-response";
+    const { baseUrl } = await listen((_request, response) => {
+      response.writeHead(200, { "content-type": "text/plain" }).end(
+        JSON.stringify({
+          authorizationRequest: "openid4vp://request",
+          sessionId: sensitiveMarker,
+        }),
+      );
+    });
+
+    const result = new VsAgentClient(baseUrl).createRequest("trusted");
+
+    await expect(result).rejects.toThrow("vs_agent_unavailable");
+    await expect(result).rejects.not.toThrow(sensitiveMarker);
+  });
+
+  it("rejects an oversized declared Content-Length before reading the body", async () => {
+    const { baseUrl } = await listen((_request, response) => {
+      response.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(70 * 1_024),
+      });
+      response.write('{"state":"ResponseVerified","receipt":');
+    });
+    const startedAt = performance.now();
+
+    await expect(new VsAgentClient(baseUrl).getSession("vs-1")).rejects.toThrow(
+      "vs_agent_unavailable",
+    );
+
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  }, 6_000);
+
+  it("rejects an oversized chunked receipt without exposing its body", async () => {
+    const sensitiveMarker = "oversized-sensitive-receipt";
+    const { baseUrl } = await listen((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write(
+        `{"state":"ResponseVerified","receipt":{"padding":"${sensitiveMarker}`,
+      );
+      response.write("x".repeat(70 * 1_024));
+      response.end('"}}');
+    });
+
+    const result = new VsAgentClient(baseUrl).getSession("vs-1");
+
+    await expect(result).rejects.toThrow("vs_agent_unavailable");
+    await expect(result).rejects.not.toThrow(sensitiveMarker);
+  });
+
   it("aborts polling after three seconds", async () => {
     const { baseUrl } = await listen((_request, _response) => {});
     const startedAt = performance.now();
