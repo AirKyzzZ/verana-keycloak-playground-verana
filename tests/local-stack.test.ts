@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -40,6 +40,7 @@ interface FakeBehavior {
   failComposeDown?: boolean;
   failTwitterStart?: boolean;
   failTwitterStop?: boolean;
+  failComposeBuild?: boolean;
   composeResources?: string;
   composeVolumes?: string;
 }
@@ -58,6 +59,7 @@ class FakeRunner implements CommandRunner {
   > &
     FakeBehavior;
   private stackRunning = false;
+  private requireComposeEnvFile = false;
 
   constructor(behavior: FakeBehavior = {}) {
     this.behavior = {
@@ -81,6 +83,38 @@ class FakeRunner implements CommandRunner {
     this.sequence.push(`${command}:${args.join(":")}`);
     this.onRun?.(command, args);
     this.options.push({ command, args, ...(options ? { options } : {}) });
+    const envFileIndex = args.indexOf("--env-file");
+    if (
+      this.requireComposeEnvFile &&
+      command === "docker" &&
+      args[0] === "compose" &&
+      envFileIndex >= 0
+    ) {
+      const envFile = args[envFileIndex + 1];
+      if (!envFile) {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "Compose env file argument is missing",
+        };
+      }
+      try {
+        await stat(resolve(options?.cwd ?? process.cwd(), envFile));
+      } catch {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: `Compose env file does not exist: ${envFile}`,
+        };
+      }
+    }
+    if (
+      command === "docker" &&
+      args.includes("build") &&
+      this.behavior.failComposeBuild
+    ) {
+      return { exitCode: 1, stdout: "", stderr: "compose build failed" };
+    }
     if (
       command === "docker" &&
       args.includes("down") &&
@@ -186,6 +220,16 @@ class FakeRunner implements CommandRunner {
     return this.calls.filter(
       ([command, args]) => command === "docker" && args.includes("up"),
     );
+  }
+
+  composeCalls(): [string, readonly string[]][] {
+    return this.calls.filter(
+      ([command, args]) => command === "docker" && args[0] === "compose",
+    );
+  }
+
+  requireExistingComposeEnvFiles(): void {
+    this.requireComposeEnvFile = true;
   }
 
   setHostToken(token: string): void {
@@ -435,7 +479,7 @@ describe("guarded local controlled stack lifecycle", () => {
     expect((await stat(openedTempFile as string)).size).toBe(0);
   });
 
-  it("cleans a published secret when its ownership state publication fails", async () => {
+  it("cleans owned state without Compose when first-file ownership publication fails", async () => {
     const root = await makeRoot();
     const runner = new FakeRunner();
     const deps = dependencies(runner, root);
@@ -443,6 +487,7 @@ describe("guarded local controlled stack lifecycle", () => {
     let statePublications = 0;
     deps.rename = async (source, destination) => {
       if (destination === statePath && ++statePublications === 2) {
+        runner.requireExistingComposeEnvFiles();
         throw new Error("ownership state publication failed");
       }
       await renamePath(source, destination);
@@ -456,6 +501,42 @@ describe("guarded local controlled stack lifecycle", () => {
       code: "ENOENT",
     });
     await expect(lstat(statePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      runner
+        .composeCalls()
+        .filter(([, args]) => args.includes("build") || args.includes("down")),
+    ).toEqual([]);
+  });
+
+  it("runs exact scoped teardown when the first Compose build was attempted", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({ failComposeBuild: true });
+    const deps = dependencies(runner, root);
+    runner.onRun = (command, args) => {
+      if (command === "docker" && args.includes("build")) {
+        runner.requireExistingComposeEnvFiles();
+      }
+    };
+
+    await expect(up(deps)).rejects.toThrow("docker compose");
+
+    expect(runner.calls).toContainEqual([
+      "docker",
+      [
+        "compose",
+        "--project-name",
+        "verana-keycloak-local-controlled",
+        "--env-file",
+        ".data/local-controlled.env",
+        "-f",
+        "compose.yaml",
+        "-f",
+        "compose.local-controlled.yaml",
+        "down",
+        "--volumes",
+        "--remove-orphans",
+      ],
+    ]);
   });
 
   it("preserves a replacement inserted after a generated-data rename", async () => {
@@ -903,6 +984,7 @@ describe("guarded local controlled stack lifecycle", () => {
         composeProject: "verana-keycloak-local-controlled",
         twitterWasRunning: false,
         twitterStopped: false,
+        composeTouched: false,
         ownedDataFiles: [],
         vsSourceCommit: "e2bba78746cb2c7ca7f43d28dc9641316f524d24",
         startedAt: "2026-07-24T00:00:00.000Z",

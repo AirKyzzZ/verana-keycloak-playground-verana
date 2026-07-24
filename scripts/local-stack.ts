@@ -67,6 +67,7 @@ interface LocalStackState {
   composeProject: typeof LOCAL_CONTROLLED.composeProject;
   twitterWasRunning: boolean;
   twitterStopped: boolean;
+  composeTouched: boolean;
   hostProcess?: HostProcess;
   ownedDataFiles: readonly (typeof generatedDataFiles)[number][];
   vsSourceCommit: string;
@@ -174,6 +175,7 @@ export async function up(
     composeProject: LOCAL_CONTROLLED.composeProject,
     twitterWasRunning: checked.twitterWasRunning,
     twitterStopped: false,
+    composeTouched: false,
     vsSourceCommit: checked.vsSourceCommit,
     startedAt: context.now().toISOString(),
     ownedDataFiles: [],
@@ -195,6 +197,9 @@ export async function up(
       await writeState(context, currentState);
     }
 
+    const composeState = { ...currentState, composeTouched: true };
+    await writeState(context, composeState);
+    currentState = composeState;
     await runCompose(context, ["build", "issuer"]);
     await runCompose(context, [
       "up",
@@ -1020,6 +1025,7 @@ function isState(value: unknown): value is LocalStackState {
     state.composeProject !== LOCAL_CONTROLLED.composeProject ||
     typeof state.twitterWasRunning !== "boolean" ||
     typeof state.twitterStopped !== "boolean" ||
+    typeof state.composeTouched !== "boolean" ||
     typeof state.vsSourceCommit !== "string" ||
     typeof state.startedAt !== "string" ||
     !Array.isArray(state.ownedDataFiles) ||
@@ -1090,6 +1096,7 @@ async function cleanupAfterFailedStartup(
   const errors = await teardown(context, {
     ...state,
     twitterStopped: state.twitterStopped || startupState.twitterStopped,
+    composeTouched: state.composeTouched || startupState.composeTouched,
     ownedDataFiles: generatedDataFiles.filter(
       (file) =>
         state.ownedDataFiles.includes(file) ||
@@ -1142,7 +1149,7 @@ async function teardown(
     errors.push(asError(error));
   }
 
-  if (hostExited) {
+  if (hostExited && state.composeTouched) {
     try {
       await runCompose(context, ["down", "--volumes", "--remove-orphans"]);
     } catch (error) {
