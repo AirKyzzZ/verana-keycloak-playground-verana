@@ -1,10 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { LOCAL_CONTROLLED } from "./local-controlled-config.js";
-import { generateLocalData } from "./setup.js";
+import { createLocalData, type LocalDataFiles } from "./setup.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const placeholderPattern = /__[A-Z0-9_]+__/;
@@ -59,17 +59,19 @@ async function writePrivateFile(path: string, contents: string): Promise<void> {
   await chmod(path, 0o600);
 }
 
-export async function generateLocalControlledData(
-  output = join(root, ".data"),
+export interface LocalControlledDataFiles extends LocalDataFiles {
+  "local-controlled.env": string;
+}
+
+export async function createLocalControlledData(
   vsAgentSourcePath = defaultVsAgentSourcePath,
-): Promise<void> {
+): Promise<LocalControlledDataFiles> {
   if (!isAbsolute(vsAgentSourcePath)) {
     throw new Error("VS Agent source path must be absolute");
   }
 
-  await generateLocalData(output);
-  const existingEnvironment = await readFile(join(output, ".env"), "utf8");
-  const localEnv = `${existingEnvironment.trim()}\n${localEnvironment().join("\n")}\n`;
+  const localData = await createLocalData();
+  const localEnv = `${localData[".env"].trim()}\n${localEnvironment().join("\n")}\n`;
   const controlledEnv = `${controlledEnvironment(vsAgentSourcePath).join("\n")}\n`;
 
   if (
@@ -81,10 +83,24 @@ export async function generateLocalControlledData(
     );
   }
 
-  await Promise.all([
-    writePrivateFile(join(output, ".env"), localEnv),
-    writePrivateFile(join(output, "local-controlled.env"), controlledEnv),
-  ]);
+  return {
+    ...localData,
+    ".env": localEnv,
+    "local-controlled.env": controlledEnv,
+  };
+}
+
+export async function generateLocalControlledData(
+  output = join(root, ".data"),
+  vsAgentSourcePath = defaultVsAgentSourcePath,
+): Promise<void> {
+  const files = await createLocalControlledData(vsAgentSourcePath);
+  await mkdir(output, { recursive: true });
+  await Promise.all(
+    Object.entries(files).map(([file, contents]) =>
+      writePrivateFile(join(output, file), contents),
+    ),
+  );
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

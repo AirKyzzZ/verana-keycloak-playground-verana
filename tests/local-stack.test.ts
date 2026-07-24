@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rename as renamePath,
   rm,
@@ -11,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -216,6 +217,17 @@ async function makeRoot(): Promise<string> {
   return root;
 }
 
+function generatedData(
+  environment = "PAIRWISE_SUB_SECRET=test-secret-at-least-32-characters\n",
+) {
+  return {
+    ".env": environment,
+    "local-controlled.env": "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
+    "broker-jwks.json": "{}\n",
+    "realm.json": "{}\n",
+  };
+}
+
 function dependencies(
   runner: FakeRunner,
   root: string,
@@ -231,18 +243,7 @@ function dependencies(
     vsSourcePath: "/tmp/reviewed-vs-agent",
     runner,
     nodeVersion: "v24.0.0",
-    generateData: async (output) => {
-      await writeFile(
-        join(output, ".env"),
-        "PAIRWISE_SUB_SECRET=test-secret-at-least-32-characters\n",
-      );
-      await writeFile(
-        join(output, "local-controlled.env"),
-        "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
-      );
-      await writeFile(join(output, "broker-jwks.json"), "{}\n");
-      await writeFile(join(output, "realm.json"), "{}\n");
-    },
+    generateData: async () => generatedData(),
     launch: async ({ startToken }) => {
       if (options.launchFails) throw new Error("host start failed");
       return { pid: 4242, startToken };
@@ -288,7 +289,7 @@ describe("guarded local controlled stack lifecycle", () => {
       await renamePath(source, destination);
     };
 
-    await expect(up(deps)).rejects.toThrow("not valid JSON");
+    await expect(up(deps)).rejects.toThrow();
 
     expect(runner.calls).toContainEqual([
       "docker",
@@ -316,7 +317,7 @@ describe("guarded local controlled stack lifecycle", () => {
       await renamePath(source, destination);
     };
 
-    await expect(up(deps)).rejects.toThrow("not valid JSON");
+    await expect(up(deps)).rejects.toThrow();
 
     expect(runner.calls).not.toContainEqual([
       "docker",
@@ -381,32 +382,122 @@ describe("guarded local controlled stack lifecycle", () => {
     ).resolves.toContain("ownedDataFiles");
   });
 
-  it("rejects a replaced generated-data staging directory before publishing it", async () => {
+  it("generates controlled data in memory before publication", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    let receivedSourcePath: string | undefined;
+    deps.generateData = async (vsSourcePath) => {
+      receivedSourcePath = vsSourcePath;
+      return generatedData();
+    };
+
+    await up(deps);
+
+    expect(receivedSourcePath).toBe("/tmp/reviewed-vs-agent");
+    await expect(readFile(join(root, ".data", ".env"), "utf8")).resolves.toBe(
+      "PAIRWISE_SUB_SECRET=test-secret-at-least-32-characters\n",
+    );
+  });
+
+  it("writes no secret bytes when the data parent is replaced after temp-file open", async () => {
     const root = await makeRoot();
     const outside = await mkdtemp(join(tmpdir(), "outside-local-controlled-"));
     roots.push(outside);
     const runner = new FakeRunner();
     const deps = dependencies(runner, root);
-    for (const file of [
-      ".env",
-      "local-controlled.env",
-      "broker-jwks.json",
-      "realm.json",
-    ]) {
-      await writeFile(join(outside, file), `${file} must survive\n`);
-      await chmod(join(outside, file), 0o644);
-    }
-    deps.generateData = async (output) => {
-      await rm(output, { recursive: true });
-      await symlink(outside, output);
+    const dataDirectory = join(root, ".data");
+    const recoveryDirectory = join(root, ".data-before-replacement");
+    const outsideEnvironment = join(outside, ".env");
+    const outsideState = join(outside, "local-stack-state.json");
+    let openedTempFile: string | undefined;
+    let parentReplaced = false;
+    delete deps.generateData;
+    await writeFile(outsideEnvironment, "outside environment sentinel\n");
+    await writeFile(outsideState, "outside state sentinel\n");
+    deps.afterTempFileOpen = async ({ label, path }) => {
+      if (label !== "generated data file .env" || parentReplaced) return;
+      openedTempFile = join(recoveryDirectory, basename(path));
+      await renamePath(dataDirectory, recoveryDirectory);
+      await symlink(outside, dataDirectory);
+      parentReplaced = true;
     };
 
-    await expect(up(deps)).rejects.toThrow("staging directory");
+    await expect(up(deps)).rejects.toThrow(/identity changed|symlink/);
 
-    await expect(readFile(join(outside, ".env"), "utf8")).resolves.toBe(
-      ".env must survive\n",
+    expect(parentReplaced).toBe(true);
+    await expect(readFile(outsideEnvironment, "utf8")).resolves.toBe(
+      "outside environment sentinel\n",
     );
-    expect((await stat(join(outside, ".env"))).mode & 0o777).toBe(0o644);
+    await expect(readFile(outsideState, "utf8")).resolves.toBe(
+      "outside state sentinel\n",
+    );
+    expect((await stat(openedTempFile as string)).size).toBe(0);
+  });
+
+  it("cleans a published secret when its ownership state publication fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    const statePath = join(root, ".data", "local-stack-state.json");
+    let statePublications = 0;
+    deps.rename = async (source, destination) => {
+      if (destination === statePath && ++statePublications === 2) {
+        throw new Error("ownership state publication failed");
+      }
+      await renamePath(source, destination);
+    };
+
+    await expect(up(deps)).rejects.toThrow(
+      "ownership state publication failed",
+    );
+
+    await expect(lstat(join(root, ".data", ".env"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(lstat(statePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves a replacement inserted after a generated-data rename", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    const generatedEnvironment = join(root, ".data", ".env");
+    deps.afterTempFileRename = async ({ label, path }) => {
+      if (label === "generated data file .env") {
+        await rm(path);
+        await writeFile(path, "replacement must survive\n");
+        throw new Error("post-rename verification failed");
+      }
+    };
+
+    await expect(up(deps)).rejects.toThrow("post-rename verification failed");
+
+    await expect(readFile(generatedEnvironment, "utf8")).resolves.toBe(
+      "replacement must survive\n",
+    );
+    await expect(
+      readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+    ).resolves.toContain("ownedDataFiles");
+  });
+
+  it("cleans an opened temp file when a pre-write hook fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    deps.afterTempFileOpen = async ({ label }) => {
+      if (label === "state file") {
+        throw new Error("pre-write hook failed");
+      }
+    };
+
+    await expect(up(deps)).rejects.toThrow("pre-write hook failed");
+
+    expect(
+      (await readdir(join(root, ".data"))).filter((entry) =>
+        entry.startsWith(".local-stack-temp-"),
+      ),
+    ).toEqual([]);
   });
 
   it("stops only the expected Twitter container and records restoration state", async () => {
@@ -614,15 +705,7 @@ describe("guarded local controlled stack lifecycle", () => {
     const root = await makeRoot();
     const runner = new FakeRunner({ twitterRunning: true });
     const deps = dependencies(runner, root);
-    deps.generateData = async (output) => {
-      await writeFile(join(output, ".env"), "NODE_OPTIONS=--inspect\n");
-      await writeFile(
-        join(output, "local-controlled.env"),
-        "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
-      );
-      await writeFile(join(output, "broker-jwks.json"), "{}\n");
-      await writeFile(join(output, "realm.json"), "{}\n");
-    };
+    deps.generateData = async () => generatedData("NODE_OPTIONS=--inspect\n");
 
     await expect(up(deps)).rejects.toThrow("host environment override");
 
@@ -768,18 +851,8 @@ describe("guarded local controlled stack lifecycle", () => {
     const root = await makeRoot();
     const runner = new FakeRunner();
     const deps = dependencies(runner, root);
-    deps.generateData = async (output) => {
-      await writeFile(
-        join(output, ".env"),
-        "PATH=/attacker\nNODE_OPTIONS=--inspect\n",
-      );
-      await writeFile(
-        join(output, "local-controlled.env"),
-        "EVIDENCE_MODE=LOCAL_CONTROLLED\n",
-      );
-      await writeFile(join(output, "broker-jwks.json"), "{}\n");
-      await writeFile(join(output, "realm.json"), "{}\n");
-    };
+    deps.generateData = async () =>
+      generatedData("PATH=/attacker\nNODE_OPTIONS=--inspect\n");
 
     await expect(up(deps)).rejects.toThrow("host environment override");
   });

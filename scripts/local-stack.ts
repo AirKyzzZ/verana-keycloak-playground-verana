@@ -1,22 +1,23 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
-  chmod,
   lstat,
   mkdir,
-  mkdtemp,
   open,
   readFile,
   realpath,
   rename,
   rm,
-  writeFile,
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { LOCAL_CONTROLLED } from "./local-controlled-config.js";
-import { generateLocalControlledData } from "./setup-local-controlled.js";
+import {
+  createLocalControlledData,
+  type LocalControlledDataFiles,
+} from "./setup-local-controlled.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataDirectoryName = ".data";
@@ -56,6 +57,11 @@ interface FileSystemIdentity {
   ino: number | bigint;
 }
 
+interface TemporaryFile {
+  path: string;
+  identity: FileSystemIdentity;
+}
+
 interface LocalStackState {
   version: 1;
   composeProject: typeof LOCAL_CONTROLLED.composeProject;
@@ -84,7 +90,15 @@ export interface LifecycleDependencies {
   vsSourcePath?: string;
   nodeVersion?: string;
   runner?: CommandRunner;
-  generateData?: (output: string, vsSourcePath: string) => Promise<void>;
+  generateData?: (vsSourcePath: string) => Promise<LocalControlledDataFiles>;
+  afterTempFileOpen?: (opened: {
+    path: string;
+    label: string;
+  }) => Promise<void>;
+  afterTempFileRename?: (renamed: {
+    path: string;
+    label: string;
+  }) => Promise<void>;
   launch?: (options: {
     root: string;
     environment: NodeJS.ProcessEnv;
@@ -199,6 +213,7 @@ export async function up(
       context.dataDirectory,
       startToken,
     );
+    await ensureLifecycleDirectory(context);
     const hostProcess = await context.launch({
       root: context.root,
       environment,
@@ -214,6 +229,14 @@ export async function up(
   } catch (error) {
     if (stateWritten) {
       await cleanupAfterFailedStartup(context, currentState);
+    } else {
+      try {
+        await removeTemporaryFiles(context);
+      } catch (cleanupError) {
+        context.write(
+          `LOCAL_CONTROLLED cleanup incomplete: ${asError(cleanupError).message}`,
+        );
+      }
     }
     throw error;
   }
@@ -274,11 +297,19 @@ function createContext(dependencies: LifecycleDependencies) {
     dataDirectoryIdentity: undefined as FileSystemIdentity | undefined,
     lifecycleDirectory: join(dataDirectory, lifecycleDirectoryName),
     lifecycleDirectoryIdentity: undefined as FileSystemIdentity | undefined,
-    stagingDirectoryIdentities: new Map<string, FileSystemIdentity>(),
+    temporaryFileIdentities: new Map<string, FileSystemIdentity>(),
+    publishedDataFiles: new Map<
+      (typeof generatedDataFiles)[number],
+      FileSystemIdentity
+    >(),
     vsSourcePath,
     nodeVersion: dependencies.nodeVersion ?? process.version,
     runner: dependencies.runner ?? systemRunner,
-    generateData: dependencies.generateData ?? generateLocalControlledData,
+    generateData: dependencies.generateData ?? createLocalControlledData,
+    afterTempFileOpen:
+      dependencies.afterTempFileOpen ?? (async () => undefined),
+    afterTempFileRename:
+      dependencies.afterTempFileRename ?? (async () => undefined),
     launch: dependencies.launch ?? launchHostProcess,
     signalProcessGroup:
       dependencies.signalProcessGroup ?? defaultSignalProcessGroup,
@@ -663,18 +694,14 @@ async function writeState(
   context: ReturnType<typeof createContext>,
   state: LocalStackState,
 ): Promise<void> {
-  const stagingDirectory = await createStagingDirectory(context, "state");
-  const stagedStatePath = join(stagingDirectory, stateFileName);
-  await writePrivateStagedFile(
+  const temporaryState = await writePrivateTemporaryFile(
     context,
-    stagingDirectory,
-    stagedStatePath,
     `${JSON.stringify(state)}\n`,
+    "state file",
   );
-  await publishStagedFile(
+  await publishTemporaryFile(
     context,
-    stagingDirectory,
-    stagedStatePath,
+    temporaryState,
     statePath(context),
     "state file",
     true,
@@ -708,46 +735,21 @@ async function readVerifiedState(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8"));
 }
 
-async function createStagingDirectory(
+async function ensureDataDirectory(
   context: ReturnType<typeof createContext>,
-  prefix: string,
-): Promise<string> {
-  await ensureLifecycleDirectory(context);
-  const stagingDirectory = await mkdtemp(
-    join(context.lifecycleDirectory, `${prefix}-`),
-  );
-  const details = await lstat(stagingDirectory);
-  if (!details.isDirectory() || details.isSymbolicLink()) {
-    throw new Error("LOCAL_CONTROLLED staging directory is invalid");
-  }
-  context.stagingDirectoryIdentities.set(stagingDirectory, {
-    dev: details.dev,
-    ino: details.ino,
-  });
-  await ensureLifecycleDirectory(context);
-  await chmod(stagingDirectory, 0o700);
-  return stagingDirectory;
-}
-
-async function assertStagingDirectory(
-  context: ReturnType<typeof createContext>,
-  stagingDirectory: string,
 ): Promise<void> {
-  if (dirname(stagingDirectory) !== context.lifecycleDirectory) {
-    throw new Error("LOCAL_CONTROLLED staging directory is outside lifecycle");
+  await assertSafePaths(context.root, context.dataDirectory);
+  try {
+    await lstat(context.dataDirectory);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const expectedIdentity =
-    context.stagingDirectoryIdentities.get(stagingDirectory);
-  if (!expectedIdentity) {
-    throw new Error("LOCAL_CONTROLLED staging directory is untracked");
-  }
-  await ensureLifecycleDirectory(context);
-  const details = await lstat(stagingDirectory);
-  if (!details.isDirectory() || details.isSymbolicLink()) {
-    throw new Error("LOCAL_CONTROLLED staging directory is invalid");
-  }
-  if (!sameFileSystemIdentity(expectedIdentity, details)) {
-    throw new Error("LOCAL_CONTROLLED staging directory identity changed");
+  await assertSafePaths(context.root, context.dataDirectory);
+  try {
+    await mkdir(context.dataDirectory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
 }
 
@@ -785,63 +787,130 @@ async function ensureLifecycleDirectory(
   context.lifecycleDirectoryIdentity ??= identity;
 }
 
-async function ensureDataDirectory(
+async function writePrivateTemporaryFile(
   context: ReturnType<typeof createContext>,
-): Promise<void> {
-  await assertSafePaths(context.root, context.dataDirectory);
-  try {
-    await lstat(context.dataDirectory);
-    return;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  await assertSafePaths(context.root, context.dataDirectory);
-  try {
-    await mkdir(context.dataDirectory, { mode: 0o700 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
-}
-
-async function writePrivateStagedFile(
-  context: ReturnType<typeof createContext>,
-  stagingDirectory: string,
-  path: string,
   contents: string,
-): Promise<void> {
-  if (dirname(path) !== stagingDirectory) {
-    throw new Error("LOCAL_CONTROLLED staging path is invalid");
+  label: string,
+): Promise<TemporaryFile> {
+  await ensureDataDirectory(context);
+  await assertDestructivePaths(context);
+  const path = join(
+    context.dataDirectory,
+    `.local-stack-temp-${randomBytes(16).toString("hex")}`,
+  );
+  if (dirname(path) !== context.dataDirectory) {
+    throw new Error("LOCAL_CONTROLLED temporary path is invalid");
   }
-  await assertStagingDirectory(context, stagingDirectory);
-  await writeFile(path, contents, { flag: "wx", mode: 0o600 });
-  const details = await lstat(path);
-  if (!details.isFile() || details.isSymbolicLink()) {
-    throw new Error("LOCAL_CONTROLLED staged state file is invalid");
+
+  const handle = await open(
+    path,
+    fsConstants.O_WRONLY |
+      fsConstants.O_CREAT |
+      fsConstants.O_EXCL |
+      fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    const openedDetails = await handle.stat();
+    if (!openedDetails.isFile()) {
+      throw new Error(`LOCAL_CONTROLLED temporary ${label} is invalid`);
+    }
+    const identity = {
+      dev: openedDetails.dev,
+      ino: openedDetails.ino,
+    };
+    context.temporaryFileIdentities.set(path, identity);
+
+    await assertDestructivePaths(context);
+    const placedDetails = await lstat(path);
+    if (
+      !placedDetails.isFile() ||
+      placedDetails.isSymbolicLink() ||
+      !sameFileSystemIdentity(identity, placedDetails)
+    ) {
+      throw new Error(`LOCAL_CONTROLLED temporary ${label} placement changed`);
+    }
+
+    await context.afterTempFileOpen({ path, label });
+    const preWriteDetails = await handle.stat();
+    if (
+      !preWriteDetails.isFile() ||
+      !sameFileSystemIdentity(identity, preWriteDetails)
+    ) {
+      throw new Error(`LOCAL_CONTROLLED temporary ${label} changed`);
+    }
+    await assertDestructivePaths(context);
+    const preWritePlacement = await lstat(path);
+    if (
+      !preWritePlacement.isFile() ||
+      preWritePlacement.isSymbolicLink() ||
+      !sameFileSystemIdentity(identity, preWritePlacement)
+    ) {
+      throw new Error(`LOCAL_CONTROLLED temporary ${label} placement changed`);
+    }
+
+    await handle.chmod(0o600);
+    await assertDestructivePaths(context);
+    await handle.writeFile(contents, { encoding: "utf8" });
+    await handle.sync();
+
+    const writtenDetails = await handle.stat();
+    if (
+      !writtenDetails.isFile() ||
+      !sameFileSystemIdentity(identity, writtenDetails)
+    ) {
+      throw new Error(`LOCAL_CONTROLLED temporary ${label} changed`);
+    }
+    await assertDestructivePaths(context);
+    const writtenPlacement = await lstat(path);
+    if (
+      !writtenPlacement.isFile() ||
+      writtenPlacement.isSymbolicLink() ||
+      !sameFileSystemIdentity(identity, writtenPlacement)
+    ) {
+      throw new Error(`LOCAL_CONTROLLED temporary ${label} placement changed`);
+    }
+    return { path, identity };
+  } finally {
+    await handle.close();
   }
-  await assertStagingDirectory(context, stagingDirectory);
-  await chmod(path, 0o600);
 }
 
 async function generateAndPublishData(
   context: ReturnType<typeof createContext>,
   state: LocalStackState,
 ): Promise<LocalStackState> {
-  const stagingDirectory = await createStagingDirectory(context, "data");
-  await context.generateData(stagingDirectory, context.vsSourcePath);
-  for (const file of generatedDataFiles) {
-    await verifyStagedGeneratedFile(context, stagingDirectory, file);
-  }
+  const generatedData = await context.generateData(context.vsSourcePath);
+  assertGeneratedData(generatedData);
   await assertGeneratedDataTargetsAvailable(context);
+  const temporaryFiles = new Map<
+    (typeof generatedDataFiles)[number],
+    TemporaryFile
+  >();
+  for (const file of generatedDataFiles) {
+    temporaryFiles.set(
+      file,
+      await writePrivateTemporaryFile(
+        context,
+        generatedData[file],
+        `generated data file ${file}`,
+      ),
+    );
+  }
 
   let publishedState = state;
   for (const file of generatedDataFiles) {
-    await publishStagedFile(
+    const temporaryFile = temporaryFiles.get(file);
+    if (!temporaryFile) {
+      throw new Error(`LOCAL_CONTROLLED generated ${file} is unavailable`);
+    }
+    await publishTemporaryFile(
       context,
-      stagingDirectory,
-      join(stagingDirectory, file),
+      temporaryFile,
       ownedDataPath(context, file),
       `generated data file ${file}`,
       false,
+      () => context.publishedDataFiles.set(file, temporaryFile.identity),
     );
     publishedState = {
       ...publishedState,
@@ -852,35 +921,36 @@ async function generateAndPublishData(
   return publishedState;
 }
 
-async function verifyStagedGeneratedFile(
-  context: ReturnType<typeof createContext>,
-  stagingDirectory: string,
-  file: (typeof generatedDataFiles)[number],
-): Promise<void> {
-  const path = join(stagingDirectory, file);
-  if (dirname(path) !== stagingDirectory) {
-    throw new Error("LOCAL_CONTROLLED staged data path is invalid");
+function assertGeneratedData(generatedData: LocalControlledDataFiles): void {
+  const keys = Object.keys(generatedData);
+  if (
+    keys.length !== generatedDataFiles.length ||
+    generatedDataFiles.some((file) => typeof generatedData[file] !== "string")
+  ) {
+    throw new Error("LOCAL_CONTROLLED generated data is invalid");
   }
-  const details = await lstat(path);
-  if (!details.isFile() || details.isSymbolicLink()) {
-    throw new Error(`LOCAL_CONTROLLED staged ${file} is invalid`);
-  }
-  await assertStagingDirectory(context, stagingDirectory);
-  await chmod(path, 0o600);
 }
 
-async function publishStagedFile(
+async function publishTemporaryFile(
   context: ReturnType<typeof createContext>,
-  stagingDirectory: string,
-  source: string,
+  temporaryFile: TemporaryFile,
   destination: string,
   label: string,
   allowVerifiedPriorState: boolean,
+  onRenamed?: () => void,
 ): Promise<void> {
-  if (dirname(source) !== stagingDirectory) {
+  if (dirname(temporaryFile.path) !== context.dataDirectory) {
     throw new Error("LOCAL_CONTROLLED publication source is invalid");
   }
-  await assertStagingDirectory(context, stagingDirectory);
+  const trackedIdentity = context.temporaryFileIdentities.get(
+    temporaryFile.path,
+  );
+  if (
+    !trackedIdentity ||
+    !sameFileSystemIdentity(trackedIdentity, temporaryFile.identity)
+  ) {
+    throw new Error(`LOCAL_CONTROLLED temporary ${label} is untracked`);
+  }
   await assertPublishTarget(
     context,
     destination,
@@ -888,16 +958,26 @@ async function publishStagedFile(
     allowVerifiedPriorState,
   );
   await assertDestructivePaths(context);
-  await assertStagingDirectory(context, stagingDirectory);
-  const sourceDetails = await lstat(source);
-  if (!sourceDetails.isFile() || sourceDetails.isSymbolicLink()) {
-    throw new Error(`LOCAL_CONTROLLED staged ${label} is invalid`);
+  const sourceDetails = await lstat(temporaryFile.path);
+  if (
+    !sourceDetails.isFile() ||
+    sourceDetails.isSymbolicLink() ||
+    !sameFileSystemIdentity(temporaryFile.identity, sourceDetails)
+  ) {
+    throw new Error(`LOCAL_CONTROLLED temporary ${label} changed`);
   }
   await assertDestructivePaths(context);
-  await assertStagingDirectory(context, stagingDirectory);
-  await context.rename(source, destination);
+  await context.rename(temporaryFile.path, destination);
+  context.temporaryFileIdentities.delete(temporaryFile.path);
+  onRenamed?.();
+  await context.afterTempFileRename({ path: destination, label });
+  await assertDestructivePaths(context);
   const destinationDetails = await lstat(destination);
-  if (!destinationDetails.isFile() || destinationDetails.isSymbolicLink()) {
+  if (
+    !destinationDetails.isFile() ||
+    destinationDetails.isSymbolicLink() ||
+    !sameFileSystemIdentity(temporaryFile.identity, destinationDetails)
+  ) {
     throw new Error(`LOCAL_CONTROLLED published ${label} is invalid`);
   }
 }
@@ -1010,7 +1090,12 @@ async function cleanupAfterFailedStartup(
   const errors = await teardown(context, {
     ...state,
     twitterStopped: state.twitterStopped || startupState.twitterStopped,
-    ownedDataFiles: startupState.ownedDataFiles,
+    ownedDataFiles: generatedDataFiles.filter(
+      (file) =>
+        state.ownedDataFiles.includes(file) ||
+        startupState.ownedDataFiles.includes(file) ||
+        context.publishedDataFiles.has(file),
+    ),
   });
   if (errors.length > 0) {
     context.write(
@@ -1125,19 +1210,53 @@ async function removeOwnedData(
   state: LocalStackState,
 ): Promise<void> {
   for (const file of state.ownedDataFiles) {
+    const expectedIdentity = context.publishedDataFiles.get(file);
+    if (expectedIdentity) {
+      await assertDestructivePaths(context);
+      const currentIdentity = ownedEntryIdentity(
+        await lstat(ownedDataPath(context, file)),
+        "file",
+        `generated data file ${file}`,
+      );
+      if (!sameFileSystemIdentity(expectedIdentity, currentIdentity)) {
+        throw new Error(
+          `LOCAL_CONTROLLED generated data file ${file} changed before cleanup`,
+        );
+      }
+    }
     await removeOwnedEntry(
       context,
       ownedDataPath(context, file),
       "file",
       `generated data file ${file}`,
     );
+    context.publishedDataFiles.delete(file);
   }
+  await removeTemporaryFiles(context);
   await removeOwnedEntry(
     context,
     context.lifecycleDirectory,
     "directory",
     "lifecycle directory",
   );
+}
+
+async function removeTemporaryFiles(
+  context: ReturnType<typeof createContext>,
+): Promise<void> {
+  for (const [path, expectedIdentity] of context.temporaryFileIdentities) {
+    await assertDestructivePaths(context);
+    const currentIdentity = ownedEntryIdentity(
+      await lstat(path),
+      "file",
+      "temporary file",
+    );
+    if (!sameFileSystemIdentity(expectedIdentity, currentIdentity)) {
+      throw new Error("LOCAL_CONTROLLED temporary file changed before cleanup");
+    }
+    await removeOwnedEntry(context, path, "file", "temporary file");
+    context.temporaryFileIdentities.delete(path);
+  }
 }
 
 async function removeState(

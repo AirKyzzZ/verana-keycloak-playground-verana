@@ -9,6 +9,12 @@ const placeholderPattern = /__[A-Z0-9_]+__/;
 
 const secret = () => randomBytes(32).toString("base64url");
 
+export interface LocalDataFiles {
+  ".env": string;
+  "broker-jwks.json": string;
+  "realm.json": string;
+}
+
 const replacePlaceholder = (
   template: string,
   placeholder: string,
@@ -21,10 +27,7 @@ const replacePlaceholder = (
   return template.replaceAll(placeholder, value);
 };
 
-export async function generateLocalData(
-  output = join(root, ".data"),
-): Promise<void> {
-  await mkdir(output, { recursive: true });
+export async function createLocalData(): Promise<LocalDataFiles> {
   const appSecret = secret();
   const brokerSecret = secret();
   const brokerCookieSecret = secret();
@@ -64,17 +67,24 @@ export async function generateLocalData(
     throw new Error("Realm template contains an unresolved placeholder");
   }
 
-  await writeFile(join(output, ".env"), env, { mode: 0o600 });
-  await writeFile(
-    join(output, "broker-jwks.json"),
-    JSON.stringify({ keys: [privateJwk] }, null, 2),
-    { mode: 0o600 },
-  );
-  await writeFile(join(output, "realm.json"), renderedRealm, { mode: 0o600 });
+  return {
+    ".env": env,
+    "broker-jwks.json": JSON.stringify({ keys: [privateJwk] }, null, 2),
+    "realm.json": renderedRealm,
+  };
+}
+
+export async function generateLocalData(
+  output = join(root, ".data"),
+): Promise<void> {
+  const files = await createLocalData();
+  await mkdir(output, { recursive: true });
   await Promise.all(
-    [".env", "broker-jwks.json", "realm.json"].map((file) =>
-      chmod(join(output, file), 0o600),
-    ),
+    Object.entries(files).map(async ([file, contents]) => {
+      const path = join(output, file);
+      await writeFile(path, contents, { mode: 0o600 });
+      await chmod(path, 0o600);
+    }),
   );
 }
 
