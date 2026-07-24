@@ -3,7 +3,8 @@
 ## Run boundary
 
 - Date: 2026-07-24, Europe/Paris (CEST, UTC+02:00).
-- Playground implementation base: `a516d8a9aa0d1e7a033554e8d6fd66e4e8a9855e`.
+- Playground implementation tested: `c8c9f6b`.
+- Runtime: Node.js 24.14.0 and pnpm 10.28.1.
 - VS Agent subject-capability commit:
   `d778012` (independently reviewed with no findings).
 - Network: Verana testnet resolver at
@@ -27,14 +28,16 @@ acceptance. No fixture result is promoted to live evidence.
 | `docker compose up -d keycloak` | 0 | Recreated pinned Keycloak 26.7.0 from the fresh realm state. |
 | `docker compose ps` | 0 | `auth-demo-keycloak-1` reported healthy. |
 | `docker compose config` | 0 | Rendered one loopback-bound Keycloak 26.7.0 service with the generated realm mounted read-only. |
-| `pnpm check` | 0 | Biome checked 49 files; both workspaces typechecked and built; 166 tests passed in 15 files. |
+| `pnpm check` | 0 | Biome checked 50 files; both workspaces typechecked and built; 169 tests passed in 16 files. |
 | `pnpm exec tsc --noEmit --target ES2024 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck scripts/verify-local-flow.ts tests/local-flow-verification.test.ts` | 0 | Standalone script and focused test TypeScript check passed. |
 | `pnpm tsx scripts/verify-keycloak.ts` | 0 | Realm, Authorization Code with S256, IdP, broker signature/secret behavior, JIT-only first login, exact mappers, authorization targets, and zero pre-created users passed. |
-| `pnpm tsx scripts/verify-local-flow.ts` | 1 | Live resolver checks passed, then acceptance stopped with `FAIL BLOCKED_SUBJECT_CONTRACT` before credential issuance. |
+| `pnpm tsx scripts/verify-local-flow.ts` | 1 | On the fresh repeat, live resolver checks passed, then acceptance stopped with `FAIL BLOCKED_SUBJECT_CONTRACT` before credential issuance. |
 | bounded read-only issuer capability probe below | 0 | The currently deployed issuer endpoint returned HTTP `404`. |
 | bounded read-only verifier capability probe below | 0 | The currently deployed verifier endpoint returned HTTP `404`. |
+| root `pnpm dev` with the safe port overrides below | 0 | Demo returned HTTP 200 and broker discovery returned HTTP 200 with issuer `http://localhost:3301`; both spawned processes were stopped after QA. |
+| Chrome boundary run below | blocked as expected | Keycloak and the Verana broker rendered correctly; the final step stopped at the unavailable local VS Agent without creating a user. |
 | `git diff --check` | 0 | No patch whitespace errors. |
-| `git status --short` | 0 | Before commit, only `.env.example`, `README.md`, `docs/evidence/README.md`, `scripts/verify-local-flow.ts`, and `tests/local-flow-verification.test.ts` were changed or untracked. |
+| `git status --short` | 0 | At the final documentation checkpoint, only `README.md` and `docs/evidence/README.md` were modified. |
 
 The exact reproducible capability probes were:
 
@@ -56,6 +59,35 @@ The HTTP 404 is observed evidence, while curl exits 0 because the probe
 intentionally records the HTTP status without `--fail`. The live acceptance
 command remains a separate non-zero result.
 
+An immediately preceding acceptance run stopped at
+`FAIL BLOCKED_TRUST_PREFLIGHT`. Four bounded direct resolver rechecks then
+returned HTTP 200 with the exact expected issuer Q1/Q2 and verifier Q1/Q3
+verdicts. The fresh script repeat passed that preflight and reached the subject
+contract boundary above. The transient failure is retained here because a
+network-dependent demonstration must not silently convert an unavailable
+preflight into success.
+
+The default application ports were already published by the unrelated local
+container `twitter-bot-vs-agent`. It was not stopped or modified. Application
+startup and Chrome QA therefore used:
+
+```bash
+set -a
+source .env.example
+source .data/.env
+set +a
+DEMO_APP_PORT=3300 \
+DEMO_APP_REDIRECT_URI=http://localhost:3300/callback \
+BROKER_PORT=3301 \
+BROKER_ISSUER=http://localhost:3301 \
+pnpm dev
+```
+
+The disposable Keycloak realm was temporarily pointed at ports 3300 and 3301
+for the browser run. Afterward, Keycloak was recreated from the generated
+read-only realm and `pnpm tsx scripts/verify-keycloak.ts` passed again,
+including the zero-user assertion.
+
 ## Verdicts
 
 - Live issuer Q1/Q2: `TRUSTED_AUTHORIZED`; response DID and VTJSC matched
@@ -74,9 +106,21 @@ command remains a separate non-zero result.
 
 ## UI and wallet evidence
 
-- Browser UI: not exercised because the live acceptance preflight has not
-  passed.
-- Keycloak JIT account creation: not claimed.
+- Chrome UI was exercised only to the honest blocked boundary. The protected
+  app redirected to Keycloak with Authorization Code, S256 PKCE, state, and
+  nonce; Keycloak displayed the Verana Wallet IdP; and the broker displayed
+  `vs_agent_unavailable` with no browser console warning or error.
+- The local-holder page rendered its local/testnet/non-physical-wallet labels
+  and server-bound CSRF fields. A real same-origin issuance form POST passed
+  the Origin/CSRF gate and reached the bounded `Local VS Agent unavailable`
+  result.
+- An earlier browser run exposed that `Referrer-Policy: no-referrer` caused
+  Chrome to send `Origin: null`. Commit `a736ef5` changes only that policy to
+  `same-origin`; exact-Origin validation still rejects null, missing,
+  cross-port, and foreign origins.
+- Keycloak JIT account creation and profile claims are not claimed because the
+  live subject-contract preflight did not pass. The restored realm still had
+  zero users.
 - Physical wallet: not exercised.
 - Trusted HTTPS wallet-to-counterparty flow: not exercised.
 - Screenshots, QR payloads, credentials, presentations, tokens, and private

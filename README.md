@@ -16,7 +16,7 @@ The repositories are intentionally separate:
 
 ## Prerequisites
 
-- Node.js and Corepack;
+- Node.js 24 LTS and Corepack;
 - pnpm 10.28.1 for this repository;
 - Docker with Compose;
 - a separate VS Agent worktree built from the reviewed subject-contract branch;
@@ -166,8 +166,9 @@ objects; their keys, key counts, authoritative fields, and full response bodies
 remain bounded. Verified receipts are then parsed again by the broker's exact
 authorization schema.
 
-Browser verification may start only after the live script prints `PASS`. API
-tests do not prove the Keycloak JIT account flow, a physical wallet flow, or a
-trusted-HTTPS counterparty.
+Positive browser/JIT verification may start only after the live script prints
+`PASS`. The UI may still be exercised up to an honestly reported blocked
+boundary. API tests do not prove the Keycloak JIT account flow, a physical
+wallet flow, or a trusted-HTTPS counterparty.
 
 See [the evidence boundary](docs/evidence/README.md) for the latest local run.
