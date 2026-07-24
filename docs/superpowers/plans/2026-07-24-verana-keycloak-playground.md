@@ -102,7 +102,7 @@ packages/plugin-openid4vc/tests/flow.integration.test.ts
 
 **Interfaces:**
 - Produces: `.data/.env` and `.data/broker-jwks.json`.
-- Produces: root commands `pnpm setup`, `pnpm check`, `pnpm test`, `pnpm build`, and `pnpm dev`.
+- Produces: root commands `pnpm run setup`, `pnpm check`, `pnpm test`, `pnpm build`, and `pnpm dev`.
 
 - [ ] **Step 1: Write the failing setup test**
 
@@ -211,7 +211,7 @@ scripts and these dependencies: `@koa/router@15.7.0`, `dotenv@17.4.2`,
 and `supertest@7.2.2` as dev dependencies. Add a package-local `tsconfig.json`
 to each package that extends the root configuration and writes to `dist/`.
 
-Use this non-secret `.env.example`; `pnpm setup` writes the four secret values
+Use this non-secret `.env.example`; `pnpm run setup` writes the four secret values
 to ignored `.data/.env`:
 
 ```dotenv
@@ -938,7 +938,7 @@ After generating the four secrets and broker JWK, read
 `__PLAYGROUND_APP_CLIENT_SECRET__` and `__BROKER_CLIENT_SECRET__`, reject any
 remaining placeholder matching `/__[A-Z0-9_]+__/`, and write
 `.data/realm.json` with mode `0600`. Keep this rendering in
-`generateLocalData` so `pnpm setup` remains the single setup command.
+`generateLocalData` so `pnpm run setup` remains the single setup command.
 
 - [ ] **Step 5: Add the pinned container**
 
@@ -968,7 +968,7 @@ services:
 Run:
 
 ```bash
-pnpm setup
+pnpm run setup
 docker compose up -d keycloak
 pnpm tsx scripts/verify-keycloak.ts
 ```
@@ -1179,7 +1179,7 @@ README startup sequence:
 
 ```bash
 pnpm install
-pnpm setup
+pnpm run setup
 docker compose up -d keycloak
 pnpm dev
 ```

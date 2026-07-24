@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { assertSecretMatch } from "../scripts/keycloak-verification.js";
 import { generateLocalData } from "../scripts/setup.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,6 +34,18 @@ describe("Keycloak realm contract", () => {
       ({ name }: { name: string }) => name === "Verana pairwise subject",
     );
 
+    expect(
+      realm.identityProviderMappers
+        .map(({ name }: { name: string }) => name)
+        .sort(),
+    ).toEqual([
+      "ACME organization group",
+      "Employee role",
+      "Verana pairwise subject",
+    ]);
+    expect(
+      client.protocolMappers.map(({ name }: { name: string }) => name).sort(),
+    ).toEqual(["organization groups", "realm roles", "verana subject"]);
     expect(realm).toMatchObject({
       realm: "verana-playground",
       enabled: true,
@@ -158,29 +171,43 @@ describe("Keycloak realm contract", () => {
 
   it("renders generated secrets into a private realm import", async () => {
     const output = await mkdtemp(join(tmpdir(), "verana-keycloak-realm-"));
-    await generateLocalData(output);
+    try {
+      await generateLocalData(output);
 
-    const env = await readFile(join(output, ".env"), "utf8");
-    const realmText = await readFile(join(output, "realm.json"), "utf8");
-    const realm = JSON.parse(realmText);
-    const secrets = Object.fromEntries(
-      env
-        .trim()
-        .split("\n")
-        .map((line) => line.split("=", 2)),
-    );
-    const client = realm.clients.find(
-      ({ clientId }: { clientId: string }) => clientId === "playground-app",
-    );
-    const identityProvider = realm.identityProviders.find(
-      ({ alias }: { alias: string }) => alias === "verana-wallet",
-    );
+      const env = await readFile(join(output, ".env"), "utf8");
+      const realmText = await readFile(join(output, "realm.json"), "utf8");
+      const realm = JSON.parse(realmText);
+      const secrets = Object.fromEntries(
+        env
+          .trim()
+          .split("\n")
+          .map((line) => line.split("=", 2)),
+      );
+      const client = realm.clients.find(
+        ({ clientId }: { clientId: string }) => clientId === "playground-app",
+      );
+      const identityProvider = realm.identityProviders.find(
+        ({ alias }: { alias: string }) => alias === "verana-wallet",
+      );
 
-    expect(realmText).not.toMatch(/__[A-Z0-9_]+__/);
-    expect(client.secret).toBe(secrets.PLAYGROUND_APP_CLIENT_SECRET);
-    expect(identityProvider.config.clientSecret).toBe(
-      secrets.BROKER_CLIENT_SECRET,
-    );
-    expect((await stat(join(output, "realm.json"))).mode & 0o777).toBe(0o600);
+      expect(realmText).not.toMatch(/__[A-Z0-9_]+__/);
+      expect(() =>
+        assertSecretMatch(
+          client.secret,
+          secrets.PLAYGROUND_APP_CLIENT_SECRET,
+          "Rendered application client secret mismatch",
+        ),
+      ).not.toThrow();
+      expect(() =>
+        assertSecretMatch(
+          identityProvider.config.clientSecret,
+          secrets.BROKER_CLIENT_SECRET,
+          "Rendered broker client secret mismatch",
+        ),
+      ).not.toThrow();
+      expect((await stat(join(output, "realm.json"))).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(output, { recursive: true, force: true });
+    }
   });
 });

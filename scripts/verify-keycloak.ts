@@ -1,6 +1,22 @@
+import { randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  assertClientSecretPost,
+  assertExactNames,
+  assertSecretMatch,
+  parseLocalSecrets,
+} from "./keycloak-verification.js";
+
 const baseUrl = "http://localhost:8080";
 const realmName = "verana-playground";
 const identityProviderAlias = "verana-wallet";
+const brokerBaseUrl = "http://localhost:3001";
+const brokerCallbackUrl =
+  "http://localhost:8080/realms/verana-playground/broker/verana-wallet/endpoint";
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 interface TokenResponse {
   access_token?: string;
@@ -68,6 +84,15 @@ interface RealmRepresentation {
 
 interface RoleRepresentation {
   name?: string;
+}
+
+interface CredentialRepresentation {
+  value?: string;
+}
+
+interface CapturedTokenRequest {
+  body: string;
+  authorizationHeader: string | undefined;
 }
 
 function requireCondition(
@@ -141,7 +166,176 @@ const getProtocolMapper = (
   return mapper;
 };
 
+const waitForTokenRequest = async (
+  request: Promise<CapturedTokenRequest>,
+): Promise<CapturedTokenRequest> =>
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("Identity-provider token request timed out")),
+      5_000,
+    );
+    request.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timeout);
+        reject(new Error("Identity-provider token request failed"));
+      },
+    );
+  });
+
+const startTokenProbe = async (): Promise<{
+  server: Server;
+  tokenRequest: Promise<CapturedTokenRequest>;
+}> => {
+  let resolveTokenRequest:
+    | ((request: CapturedTokenRequest) => void)
+    | undefined;
+  let rejectTokenRequest: (() => void) | undefined;
+  const tokenRequest = new Promise<CapturedTokenRequest>((resolve, reject) => {
+    resolveTokenRequest = resolve;
+    rejectTokenRequest = reject;
+  });
+  const server = createServer((request, response) => {
+    if (request.method !== "POST" || request.url !== "/token") {
+      response.writeHead(404).end();
+      return;
+    }
+
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => {
+      body += chunk;
+      if (body.length > 8_192) {
+        rejectTokenRequest?.();
+        request.destroy();
+      }
+    });
+    request.on("error", () => rejectTokenRequest?.());
+    request.on("end", () => {
+      resolveTokenRequest?.({
+        body,
+        authorizationHeader: request.headers.authorization,
+      });
+      response
+        .writeHead(400, {
+          "cache-control": "no-store",
+          "content-type": "application/json",
+        })
+        .end('{"error":"invalid_grant"}');
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", () =>
+      reject(new Error("Identity-provider secret probe could not start")),
+    );
+    server.listen(3001, "127.0.0.1", () => resolve());
+  });
+
+  return { server, tokenRequest };
+};
+
+const stopTokenProbe = async (server: Server): Promise<void> => {
+  server.closeAllConnections();
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(new Error("Identity-provider secret probe could not stop"));
+        return;
+      }
+      resolve();
+    });
+  });
+};
+
+const getCookieHeader = (response: Response): string =>
+  response.headers
+    .getSetCookie()
+    .map((value) => value.split(";", 1)[0])
+    .join("; ");
+
+const verifyIdentityProviderSecret = async (
+  expectedSecret: string,
+): Promise<void> => {
+  const { server, tokenRequest } = await startTokenProbe();
+
+  try {
+    const authorizationUrl = new URL(
+      `${baseUrl}/realms/${realmName}/protocol/openid-connect/auth`,
+    );
+    authorizationUrl.search = new URLSearchParams({
+      client_id: "playground-app",
+      redirect_uri: "http://localhost:3000/callback",
+      response_type: "code",
+      scope: "openid",
+      kc_idp_hint: identityProviderAlias,
+      code_challenge: randomBytes(32).toString("base64url"),
+      code_challenge_method: "S256",
+      state: randomBytes(32).toString("base64url"),
+    }).toString();
+
+    const authorizationResponse = await fetch(authorizationUrl, {
+      redirect: "manual",
+    });
+    const brokerLoginLocation = authorizationResponse.headers.get("location");
+    requireCondition(
+      authorizationResponse.status === 303 && brokerLoginLocation,
+      "Keycloak did not start the broker login",
+    );
+    const cookies = getCookieHeader(authorizationResponse);
+    requireCondition(cookies.length > 0, "Keycloak broker cookies are missing");
+
+    const brokerLoginResponse = await fetch(
+      new URL(brokerLoginLocation, authorizationUrl),
+      {
+        headers: { cookie: cookies },
+        redirect: "manual",
+      },
+    );
+    const externalAuthorizationLocation =
+      brokerLoginResponse.headers.get("location");
+    requireCondition(
+      brokerLoginResponse.status === 303 && externalAuthorizationLocation,
+      "Keycloak did not redirect to the identity provider",
+    );
+    const externalAuthorization = new URL(externalAuthorizationLocation);
+    requireCondition(
+      externalAuthorization.origin === brokerBaseUrl &&
+        externalAuthorization.pathname === "/auth",
+      "Keycloak used an unexpected identity-provider authorization endpoint",
+    );
+    const callbackUrl = externalAuthorization.searchParams.get("redirect_uri");
+    const brokerState = externalAuthorization.searchParams.get("state");
+    requireCondition(
+      callbackUrl === brokerCallbackUrl && brokerState,
+      "Keycloak broker callback parameters are invalid",
+    );
+
+    const callback = new URL(callbackUrl);
+    callback.searchParams.set("code", "secret-verification-code");
+    callback.searchParams.set("state", brokerState);
+    await fetch(callback, {
+      headers: { cookie: cookies },
+      redirect: "manual",
+    });
+
+    const capturedRequest = await waitForTokenRequest(tokenRequest);
+    assertClientSecretPost({
+      ...capturedRequest,
+      expectedSecret,
+    });
+  } finally {
+    await stopTokenProbe(server);
+  }
+};
+
 const verify = async (): Promise<void> => {
+  const localSecrets = parseLocalSecrets(
+    await readFile(join(root, ".data", ".env"), "utf8"),
+  );
   const accessToken = await getAdminToken();
   const realm = await requestJson<RealmRepresentation>(
     `/admin/realms/${realmName}`,
@@ -179,6 +373,10 @@ const verify = async (): Promise<void> => {
     "playground-app does not enforce Authorization Code with S256",
   );
   console.log("PASS client: playground-app Authorization Code with S256");
+  const clientSecret = await requestJson<CredentialRepresentation>(
+    `/admin/realms/${realmName}/clients/${client.id}/client-secret`,
+    accessToken,
+  );
 
   const identityProvider = await requestJson<IdentityProviderRepresentation>(
     `/admin/realms/${realmName}/identity-provider/instances/${identityProviderAlias}`,
@@ -214,6 +412,13 @@ const verify = async (): Promise<void> => {
   );
   console.log("PASS IdP: verana-wallet");
   console.log("PASS signature validation: broker JWKS");
+  await verifyIdentityProviderSecret(localSecrets.BROKER_CLIENT_SECRET);
+  assertSecretMatch(
+    clientSecret.value,
+    localSecrets.PLAYGROUND_APP_CLIENT_SECRET,
+    "Imported application client secret mismatch",
+  );
+  console.log("PASS generated secrets: application client and broker IdP");
 
   const flows = await requestJson<AuthenticationFlowRepresentation[]>(
     `/admin/realms/${realmName}/authentication/flows`,
@@ -245,6 +450,11 @@ const verify = async (): Promise<void> => {
   const mappers = await requestJson<MapperRepresentation[]>(
     `/admin/realms/${realmName}/identity-provider/instances/${identityProviderAlias}/mappers`,
     accessToken,
+  );
+  assertExactNames(
+    mappers,
+    ["ACME organization group", "Employee role", "Verana pairwise subject"],
+    "Identity-provider mapper allowlist is invalid",
   );
   const groupMapper = getMapper(mappers, "ACME organization group");
   requireCondition(
@@ -282,6 +492,11 @@ const verify = async (): Promise<void> => {
   const protocolMappers = await requestJson<ProtocolMapperRepresentation[]>(
     `/admin/realms/${realmName}/clients/${client.id}/protocol-mappers/models`,
     accessToken,
+  );
+  assertExactNames(
+    protocolMappers,
+    ["organization groups", "realm roles", "verana subject"],
+    "Client protocol mapper allowlist is invalid",
   );
   const subjectProtocolMapper = getProtocolMapper(
     protocolMappers,
