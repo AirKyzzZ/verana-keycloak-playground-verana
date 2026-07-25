@@ -60,31 +60,35 @@ function gateMatchesVerdict(value: {
 const GATE_INVARIANT_MESSAGE =
   "a gate id is present only for a TRUSTED_AUTHORIZED verdict";
 
-const reviewedOfferSchema = z.strictObject({
-  gateId: gateIdSchema,
-  verdict: verdictSchema,
-  issuerDid: z.string().max(MAX_URL_LENGTH).nullable(),
-  credentialIssuer: z.string().max(MAX_URL_LENGTH),
-  evidence: evidenceSchema,
-}).refine(gateMatchesVerdict, { message: GATE_INVARIANT_MESSAGE });
+const reviewedOfferSchema = z
+  .strictObject({
+    gateId: gateIdSchema,
+    verdict: verdictSchema,
+    issuerDid: z.string().max(MAX_URL_LENGTH).nullable(),
+    credentialIssuer: z.string().max(MAX_URL_LENGTH),
+    evidence: evidenceSchema,
+  })
+  .refine(gateMatchesVerdict, { message: GATE_INVARIANT_MESSAGE });
 
-const resolvedPresentationSchema = z.strictObject({
-  gateId: gateIdSchema,
-  verdict: verdictSchema,
-  evidence: evidenceSchema,
-  request: z.strictObject({
-    clientId: z.string().trim().min(1).max(MAX_URL_LENGTH),
-    clientIdPrefix: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
-    verifierDid: z.string().max(MAX_URL_LENGTH).nullable(),
-    // Present but never authenticated: the DID a request merely claims, which
-    // must never be treated as identity.
-    unverifiedClaimedDid: z.string().max(MAX_URL_LENGTH).nullable(),
-    requestedVct: z.string().max(MAX_URL_LENGTH).nullable(),
-    requestedClaims: z
-      .array(z.string().max(MAX_IDENTIFIER_LENGTH))
-      .max(MAX_COLLECTION_ITEMS),
-  }),
-}).refine(gateMatchesVerdict, { message: GATE_INVARIANT_MESSAGE });
+const resolvedPresentationSchema = z
+  .strictObject({
+    gateId: gateIdSchema,
+    verdict: verdictSchema,
+    evidence: evidenceSchema,
+    request: z.strictObject({
+      clientId: z.string().trim().min(1).max(MAX_URL_LENGTH),
+      clientIdPrefix: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
+      verifierDid: z.string().max(MAX_URL_LENGTH).nullable(),
+      // Present but never authenticated: the DID a request merely claims, which
+      // must never be treated as identity.
+      unverifiedClaimedDid: z.string().max(MAX_URL_LENGTH).nullable(),
+      requestedVct: z.string().max(MAX_URL_LENGTH).nullable(),
+      requestedClaims: z
+        .array(z.string().max(MAX_IDENTIFIER_LENGTH))
+        .max(MAX_COLLECTION_ITEMS),
+    }),
+  })
+  .refine(gateMatchesVerdict, { message: GATE_INVARIANT_MESSAGE });
 
 const presentationRequestSchema = z.strictObject({
   authorizationRequest: z.string().trim().min(1).max(MAX_EXCHANGE_VALUE_LENGTH),
