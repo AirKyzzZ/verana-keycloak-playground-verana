@@ -552,6 +552,15 @@ function capacityFromPosixDf(output: string): number | undefined {
   ) {
     return undefined;
   }
+  const accountedBlocks = usedBlocks + availableBlocks;
+  if (
+    usedBlocks > totalBlocks ||
+    availableBlocks > totalBlocks ||
+    !Number.isSafeInteger(accountedBlocks) ||
+    accountedBlocks > totalBlocks
+  ) {
+    return undefined;
+  }
   const availableBytes = availableBlocks * 1024;
   return Number.isSafeInteger(availableBytes) ? availableBytes : undefined;
 }

@@ -30,8 +30,10 @@ const roots: string[] = [];
 interface FakeBehavior {
   colimaDf?: string;
   colimaDfExitCode?: number;
+  colimaDfThrows?: boolean;
   dockerContext?: string;
   dockerContextExitCode?: number;
+  dockerContextThrows?: boolean;
   driverStatus?: string;
   nodeMajor?: number;
   portOwners?: Partial<Record<number, string>>;
@@ -190,6 +192,9 @@ class FakeRunner implements CommandRunner {
       if (!this.hasExactArgs(args, ["context", "show"])) {
         throw new Error(`Unexpected fake command: docker ${args.join(" ")}`);
       }
+      if (this.behavior.dockerContextThrows) {
+        throw new Error("sensitive Docker context failure details");
+      }
       return {
         exitCode: this.behavior.dockerContextExitCode ?? 0,
         stdout: `${this.behavior.dockerContext ?? "default"}\n`,
@@ -201,6 +206,9 @@ class FakeRunner implements CommandRunner {
         !this.hasExactArgs(args, ["ssh", "--", "df", "-Pk", "/var/lib/docker"])
       ) {
         throw new Error(`Unexpected fake command: colima ${args.join(" ")}`);
+      }
+      if (this.behavior.colimaDfThrows) {
+        throw new Error("sensitive Colima df failure details");
       }
       return {
         exitCode: this.behavior.colimaDfExitCode ?? 0,
@@ -1149,6 +1157,22 @@ describe("guarded local controlled stack lifecycle", () => {
       "unsafe available blocks",
       "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 9007199254740992 0 9007199254740992 0% /\n",
     ],
+    [
+      "used blocks greater than total blocks",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000000 10000001 0 100% /\n",
+    ],
+    [
+      "available blocks greater than total blocks",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 1 0 9000000 0% /\n",
+    ],
+    [
+      "used and available blocks greater than total blocks",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000000 2000000 9000000 20% /\n",
+    ],
+    [
+      "unsafe used and available block addition",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 9007199254740991 9007199254740991 8388608 100% /\n",
+    ],
   ])("fails closed for %s in Colima df output", async (_name, colimaDf) => {
     const root = await makeRoot();
     const runner = new FakeRunner({
@@ -1188,8 +1212,33 @@ describe("guarded local controlled stack lifecycle", () => {
         ...behavior,
       });
 
-      await expect(preflight(dependencies(runner, root))).rejects.toThrow(
-        "LOCAL_CONTROLLED Docker runtime capacity cannot be determined",
+      await expect(preflight(dependencies(runner, root))).rejects.toMatchObject(
+        {
+          message:
+            "LOCAL_CONTROLLED Docker runtime capacity cannot be determined",
+        },
+      );
+      expect(runner.composeUpCalls()).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["Docker context command", { dockerContextThrows: true }],
+    ["Colima df command", { dockerContext: "colima", colimaDfThrows: true }],
+  ] satisfies readonly [string, FakeBehavior][])(
+    "fails closed with the exact static error when the %s throws",
+    async (_name, behavior) => {
+      const root = await makeRoot();
+      const runner = new FakeRunner({
+        driverStatus: '[["driver-type","io.containerd.snapshotter.v1"]]\n',
+        ...behavior,
+      });
+
+      await expect(preflight(dependencies(runner, root))).rejects.toMatchObject(
+        {
+          message:
+            "LOCAL_CONTROLLED Docker runtime capacity cannot be determined",
+        },
       );
       expect(runner.composeUpCalls()).toHaveLength(0);
     },
