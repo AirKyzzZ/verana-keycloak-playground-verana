@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import Router, { type RouterContext } from "@koa/router";
 import Koa from "koa";
 
-import { authorization, LOCAL_CONTROLLED_CONTRACT, q1 } from "./contract.js";
+import { LOCAL_CONTROLLED_CONTRACT, resolveResponse } from "./contract.js";
 
 const LOCAL_VCT = Object.freeze({
   vct: LOCAL_CONTROLLED_CONTRACT.vct,
@@ -31,24 +31,39 @@ interface ArmedFault {
   mode: ResolverFaultMode;
 }
 
-function requiredQuery(
-  value: string | string[] | undefined,
-): string | undefined {
-  if (typeof value !== "string" || value.trim().length === 0) return undefined;
-  return value;
+const MAXIMUM_REQUEST_BYTES = 64 * 1024;
+
+interface ResolveRequest {
+  did: string;
+  withParticipations: boolean;
 }
 
-function trustDid(ctx: RouterContext): string | undefined {
-  return requiredQuery(ctx.query.did);
+// Koa 3 ships no body parser and the plan forbids a new dependency, so the
+// JSON body is read directly with a hard byte bound.
+async function readJsonBody(ctx: RouterContext): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let received = 0;
+  for await (const chunk of ctx.req) {
+    const buffer = chunk as Buffer;
+    received += buffer.length;
+    if (received > MAXIMUM_REQUEST_BYTES) throw new Error("body_too_large");
+    chunks.push(buffer);
+  }
+  if (received === 0) throw new Error("body_required");
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-function authorizationQuery(
-  ctx: RouterContext,
-): { did: string; vtjscId: string } | undefined {
-  const did = requiredQuery(ctx.query.did);
-  const vtjscId = requiredQuery(ctx.query.vtjscId);
-  if (!did || !vtjscId) return undefined;
-  return { did, vtjscId };
+function parseResolveRequest(body: unknown): ResolveRequest | undefined {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return undefined;
+  }
+  const record = body as Record<string, unknown>;
+  const did = record.did;
+  if (typeof did !== "string" || !did.startsWith("did:")) return undefined;
+  return {
+    did,
+    withParticipations: Object.hasOwn(record, "participations"),
+  };
 }
 
 export function createLocalResolver(options: LocalResolverOptions = {}): Koa {
@@ -84,14 +99,29 @@ export function createLocalResolver(options: LocalResolverOptions = {}): Koa {
     ctx.body = { status: "ok" };
   });
 
-  router.get("/v1/trust/resolve", (ctx) => {
-    const did = trustDid(ctx);
-    if (!did) {
+  router.post("/v4/verifiable-trust/resolve", async (ctx) => {
+    let body: unknown;
+    try {
+      body = await readJsonBody(ctx);
+    } catch {
       ctx.status = 400;
-      ctx.body = { error: "invalid_query" };
+      ctx.body = { error: "invalid_request" };
       return;
     }
-    if (did === LOCAL_CONTROLLED_CONTRACT.verifierDid) {
+
+    const parsed = parseResolveRequest(body);
+    if (!parsed) {
+      ctx.status = 400;
+      ctx.body = { error: "invalid_request" };
+      return;
+    }
+
+    // Faults target the verifier's Q1 only, so an armed fault never disturbs
+    // the issuance path or the authorization queries.
+    if (
+      parsed.did === LOCAL_CONTROLLED_CONTRACT.verifierDid &&
+      !parsed.withParticipations
+    ) {
       const fault = consumeVerifierFault();
       if (fault === "unavailable") {
         ctx.status = 503;
@@ -109,27 +139,8 @@ export function createLocalResolver(options: LocalResolverOptions = {}): Koa {
         return;
       }
     }
-    ctx.body = q1(did);
-  });
 
-  router.get("/v1/trust/issuer-authorization", (ctx) => {
-    const query = authorizationQuery(ctx);
-    if (!query) {
-      ctx.status = 400;
-      ctx.body = { error: "invalid_query" };
-      return;
-    }
-    ctx.body = authorization("issuer", query.did, query.vtjscId);
-  });
-
-  router.get("/v1/trust/verifier-authorization", (ctx) => {
-    const query = authorizationQuery(ctx);
-    if (!query) {
-      ctx.status = 400;
-      ctx.body = { error: "invalid_query" };
-      return;
-    }
-    ctx.body = authorization("verifier", query.did, query.vtjscId);
+    ctx.body = resolveResponse(parsed, now());
   });
 
   router.get("/vct/local-controlled-employee", (ctx) => {

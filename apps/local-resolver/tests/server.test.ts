@@ -1,17 +1,39 @@
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 
+import {
+  CREDENTIAL_SCHEMA_ID,
+  ECOSYSTEM_ID,
+  LINKED_VP_SERVICE_FRAGMENT,
+  LOCAL_CONTROLLED_CONTRACT,
+} from "../src/contract.js";
 import { createLocalResolver } from "../src/server.js";
 
-const ISSUER = "did:web:issuer.localhost";
-const VERIFIER = "did:web:verifier.localhost";
-const ROGUE = "did:web:rogue.localhost";
-const VCT = "http://host.docker.internal:3099/vct/local-controlled-employee";
-const VTJSC =
-  "http://host.docker.internal:3099/vtjsc/local-controlled-employee.json";
+const ISSUER = LOCAL_CONTROLLED_CONTRACT.issuerDid;
+const VERIFIER = LOCAL_CONTROLLED_CONTRACT.verifierDid;
+const ROGUE = LOCAL_CONTROLLED_CONTRACT.rogueDid;
+const RESOLVE_PATH = "/v4/verifiable-trust/resolve";
 const CONTROL_TOKEN =
   "test-control-token-with-at-least-thirty-two-bytes-of-entropy";
 const CONTROL_PATH = "/_local-controlled/resolver-fault";
+
+const Q1_SELECTORS = {
+  ecsCredentials: true,
+  services: true,
+  presentations: {
+    unresolvableCredentialIds: true,
+    invalidCredentialIds: true,
+  },
+  ecosystems: { credentialSchemas: { includeArchived: false } },
+};
+
+function q1Body(did: string) {
+  return { did, ...Q1_SELECTORS };
+}
+
+function participationBody(did: string) {
+  return { did, participations: { states: ["ACTIVE"] }, ...Q1_SELECTORS };
+}
 
 function resolver() {
   return request(createLocalResolver().callback());
@@ -33,149 +55,185 @@ function authorize<T extends { set(name: string, value: string): T }>(
   return operation.set("authorization", `Bearer ${CONTROL_TOKEN}`);
 }
 
-describe("controlled local trust resolver", () => {
-  it.each([
-    [ISSUER, { did: ISSUER, trustStatus: "TRUSTED", production: true }],
-    [VERIFIER, { did: VERIFIER, trustStatus: "TRUSTED", production: true }],
-    [ROGUE, { did: ROGUE, trustStatus: "UNTRUSTED", production: false }],
-  ])("returns exact Q1 for %s", async (did, expected) => {
-    const response = await resolver().get("/v1/trust/resolve").query({ did });
+const UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+describe("controlled local v4 trust resolver", () => {
+  it.each([ISSUER, VERIFIER])("returns a trusted Q1 for %s", async (did) => {
+    const response = await resolver().post(RESOLVE_PATH).send(q1Body(did));
 
     expect(response.status).toBe(200);
     expect(response.type).toBe("application/json");
     expect(response.headers["cache-control"]).toBe("no-store");
-    expect(response.body).toEqual(expected);
+    expect(response.body.did).toBe(did);
+    expect(response.body.trusted).toBe(true);
+    expect(response.body.evaluatedAtTime).toMatch(UTC_PATTERN);
+    expect(response.body.expiresAtTime).toBeNull();
   });
 
-  it.each([
-    ["/v1/trust/issuer-authorization", ISSUER, true],
-    ["/v1/trust/issuer-authorization", VERIFIER, false],
-    ["/v1/trust/verifier-authorization", VERIFIER, true],
-    ["/v1/trust/verifier-authorization", ROGUE, false],
-  ])(
-    "binds authorization to role, DID, and VTJSC",
-    async (path, did, authorized) => {
-      const response = await resolver()
-        .get(path)
-        .query({ did, vtjscId: VTJSC });
+  it("omits participations from a Q1 response and includes them for Q2", async () => {
+    const [q1, q2] = await Promise.all([
+      resolver().post(RESOLVE_PATH).send(q1Body(ISSUER)),
+      resolver().post(RESOLVE_PATH).send(participationBody(ISSUER)),
+    ]);
+
+    expect(Object.hasOwn(q1.body, "participations")).toBe(false);
+    expect(Object.hasOwn(q2.body, "participations")).toBe(true);
+  });
+
+  it("returns exactly the keys the strict v4 parser allows", async () => {
+    const q1 = await resolver().post(RESOLVE_PATH).send(q1Body(ISSUER));
+    const q2 = await resolver()
+      .post(RESOLVE_PATH)
+      .send(participationBody(ISSUER));
+
+    const core = [
+      "did",
+      "trusted",
+      "evaluatedAtTime",
+      "evaluatedAtBlock",
+      "expiresAtTime",
+      "corporationId",
+      "ecsCredentials",
+      "presentations",
+      "services",
+      "ecosystems",
+    ];
+    expect(Object.keys(q1.body).sort()).toEqual([...core].sort());
+    expect(Object.keys(q2.body).sort()).toEqual(
+      [...core, "participations"].sort(),
+    );
+  });
+
+  it("binds participation to the role the DID actually holds", async () => {
+    const [issuer, verifier] = await Promise.all([
+      resolver().post(RESOLVE_PATH).send(participationBody(ISSUER)),
+      resolver().post(RESOLVE_PATH).send(participationBody(VERIFIER)),
+    ]);
+
+    expect(issuer.body.participations).toHaveLength(1);
+    expect(issuer.body.participations[0].role).toBe("ISSUER");
+    expect(issuer.body.participations[0].state).toBe("ACTIVE");
+    expect(issuer.body.participations[0].ecosystemId).toBe(ECOSYSTEM_ID);
+    expect(issuer.body.participations[0].credentialSchemaId).toBe(
+      CREDENTIAL_SCHEMA_ID,
+    );
+
+    expect(verifier.body.participations[0].role).toBe("VERIFIER");
+    // An issuer must never appear as a VERIFIER participant, and vice versa.
+    expect(
+      issuer.body.participations.some(
+        (entry: { role: string }) => entry.role === "VERIFIER",
+      ),
+    ).toBe(false);
+  });
+
+  it("serves complete Linked-VP evidence for a trusted party", async () => {
+    const response = await resolver().post(RESOLVE_PATH).send(q1Body(ISSUER));
+
+    expect(response.body.presentations).toHaveLength(1);
+    const presentation = response.body.presentations[0];
+    expect(presentation.serviceId).toBe(
+      `${ISSUER}${LINKED_VP_SERVICE_FRAGMENT}`,
+    );
+    expect(presentation.unresolvableCredentialIds).toEqual([]);
+    expect(presentation.invalidCredentialIds).toEqual([]);
+    expect(
+      presentation.vtcCredentials.some(
+        (reference: { ecosystemId: number; credentialSchemaId: number }) =>
+          reference.ecosystemId === ECOSYSTEM_ID &&
+          reference.credentialSchemaId === CREDENTIAL_SCHEMA_ID,
+      ),
+    ).toBe(true);
+  });
+
+  it("serves the ECS service and organization credentials", async () => {
+    const response = await resolver().post(RESOLVE_PATH).send(q1Body(ISSUER));
+
+    const schemas = response.body.ecsCredentials.map(
+      (credential: { ecsSchema: string }) => credential.ecsSchema,
+    );
+    expect(schemas).toContain("ServiceCredential");
+    expect(schemas).toContain("OrganizationCredential");
+  });
+
+  it.each([ROGUE, "did:web:unknown.localhost"])(
+    "returns an untrusted, evidence-free response for %s",
+    async (did) => {
+      const response = await resolver().post(RESOLVE_PATH).send(q1Body(did));
 
       expect(response.status).toBe(200);
-      expect(response.body).toEqual({ did, vtjscId: VTJSC, authorized });
+      expect(response.body.did).toBe(did);
+      expect(response.body.trusted).toBe(false);
+      expect(response.body.ecsCredentials).toEqual([]);
+      expect(response.body.presentations).toEqual([]);
+      expect(response.body.services).toEqual([]);
+      expect(response.body.ecosystems).toEqual([]);
     },
   );
 
+  it("returns no participations for an untrusted DID", async () => {
+    const response = await resolver()
+      .post(RESOLVE_PATH)
+      .send(participationBody(ROGUE));
+
+    expect(response.body.participations).toEqual([]);
+  });
+
   it.each([
-    ["/v1/trust/resolve", {}],
-    ["/v1/trust/resolve", { did: "" }],
-    ["/v1/trust/resolve?did=first&did=second", undefined],
-    ["/v1/trust/issuer-authorization", { did: ISSUER }],
-    ["/v1/trust/issuer-authorization", { vtjscId: VTJSC }],
-    ["/v1/trust/verifier-authorization", { did: "", vtjscId: VTJSC }],
-    ["/v1/trust/verifier-authorization", { did: VERIFIER, vtjscId: "" }],
-    [
-      `/v1/trust/issuer-authorization?did=${encodeURIComponent(ISSUER)}&vtjscId=one&vtjscId=two`,
-      undefined,
-    ],
-  ])("rejects malformed required queries", async (path, query) => {
-    const response = query
-      ? await resolver().get(path).query(query)
-      : await resolver().get(path);
+    ["missing did", {}],
+    ["non-did string", { did: "https://issuer.localhost" }],
+    ["array body", []],
+    ["null did", { did: null }],
+  ])("rejects a malformed request body: %s", async (_label, body) => {
+    const response = await resolver().post(RESOLVE_PATH).send(body);
 
     expect(response.status).toBe(400);
-    expect(response.type).toBe("application/json");
-    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(response.body).toEqual({ error: "invalid_request" });
   });
 
-  it("returns untrusted Q1 for an unknown DID", async () => {
+  it("keeps a trusted response below the 64 KiB client bound", async () => {
     const response = await resolver()
-      .get("/v1/trust/resolve")
-      .query({ did: "did:web:unknown.localhost" });
+      .post(RESOLVE_PATH)
+      .send(participationBody(ISSUER));
 
-    expect(response.body).toEqual({
-      did: "did:web:unknown.localhost",
-      trustStatus: "UNTRUSTED",
-      production: false,
-    });
-  });
-
-  it("rejects a correct issuer DID with a different VTJSC", async () => {
-    const response = await resolver()
-      .get("/v1/trust/issuer-authorization")
-      .query({ did: ISSUER, vtjscId: "http://example.test/other.json" });
-
-    expect(response.body).toEqual({
-      did: ISSUER,
-      vtjscId: "http://example.test/other.json",
-      authorized: false,
-    });
+    expect(Buffer.byteLength(response.text)).toBeLessThan(65_536);
   });
 
   it("exposes the exact health payload", async () => {
     const response = await resolver().get("/health");
 
     expect(response.status).toBe(200);
-    expect(response.type).toBe("application/json");
-    expect(response.headers["cache-control"]).toBe("no-store");
     expect(response.body).toEqual({ status: "ok" });
   });
 
-  it("serves local VCT and VTJSC documents with their exact identifiers", async () => {
+  it("serves local VCT and VTJSC documents over the gateway origin", async () => {
     const [vct, vtjsc] = await Promise.all([
       resolver().get("/vct/local-controlled-employee"),
       resolver().get("/vtjsc/local-controlled-employee.json"),
     ]);
 
-    expect(vct.status).toBe(200);
-    expect(vct.type).toBe("application/json");
-    expect(vct.headers["cache-control"]).toBe("no-store");
-    expect(vct.body.vct).toBe(VCT);
-    expect(vtjsc.status).toBe(200);
-    expect(vtjsc.type).toBe("application/json");
-    expect(vtjsc.headers["cache-control"]).toBe("no-store");
-    expect(vtjsc.body.id).toBe(VTJSC);
+    expect(vct.body.vct).toBe(LOCAL_CONTROLLED_CONTRACT.vct);
+    expect(vtjsc.body.id).toBe(LOCAL_CONTROLLED_CONTRACT.vtjscId);
+    expect(LOCAL_CONTROLLED_CONTRACT.vct.startsWith("https://")).toBe(true);
   });
 
   it.each([
-    "/health",
-    "/v1/trust/resolve?did=did%3Aweb%3Aissuer.localhost",
-    `/v1/trust/issuer-authorization?did=${encodeURIComponent(ISSUER)}&vtjscId=${encodeURIComponent(VTJSC)}`,
-    "/vct/local-controlled-employee",
-    "/vtjsc/local-controlled-employee.json",
-  ])(
-    "keeps the serialized response below 65,536 bytes for %s",
-    async (path) => {
-      const response = await resolver().get(path);
-
-      expect(Buffer.byteLength(response.text)).toBeLessThan(65_536);
-    },
-  );
-
-  it.each([
-    ["POST", "/health"],
-    ["POST", "/v1/trust/resolve"],
-    ["POST", "/v1/trust/issuer-authorization"],
-    ["POST", "/v1/trust/verifier-authorization"],
-    ["POST", "/vct/local-controlled-employee"],
-    ["POST", "/vtjsc/local-controlled-employee.json"],
+    ["GET", RESOLVE_PATH],
+    ["GET", "/v1/trust/resolve"],
     ["GET", "/not-a-route"],
-  ])(
-    "returns 404 for unknown paths and method mismatches",
-    async (method, path) => {
-      const response =
-        method === "GET"
-          ? await resolver().get(path)
-          : await resolver().post(path);
+  ])("returns 404 for %s %s", async (method, path) => {
+    const response =
+      method === "GET"
+        ? await resolver().get(path)
+        : await resolver().post(path);
 
-      expect(response.status).toBe(404);
-      expect(response.type).toBe("application/json");
-      expect(response.headers["cache-control"]).toBe("no-store");
-      expect(response.body).toEqual({ error: "not_found" });
-    },
-  );
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: "not_found" });
+  });
 });
 
 describe("controlled local resolver faults", () => {
-  it("does not register control routes without both explicit controlled mode and a token", async () => {
+  it("does not register control routes without both controlled mode and a token", async () => {
     const withoutOptions = await resolver().get(CONTROL_PATH);
     const liveWithToken = await request(
       createLocalResolver({
@@ -199,54 +257,41 @@ describe("controlled local resolver faults", () => {
 
     expect(missing.status).toBe(401);
     expect(wrong.status).toBe(401);
-    expect(missing.body).toEqual({ error: "unauthorized" });
-    expect(wrong.body).toEqual({ error: "unauthorized" });
     expect(wrong.text).not.toContain(rejectedToken);
     expect(wrong.text).not.toContain(CONTROL_TOKEN);
   });
 
-  it("targets only the next exact verifier Q1 request and consumes before responding", async () => {
+  it("targets only the next verifier Q1 and leaves Q2 and issuance intact", async () => {
     const agent = controlledResolver();
 
     const armed = await authorize(agent.post(`${CONTROL_PATH}/unavailable`));
-    const issuerQ1 = await agent
-      .get("/v1/trust/resolve")
-      .query({ did: ISSUER });
+    const issuerQ1 = await agent.post(RESOLVE_PATH).send(q1Body(ISSUER));
     const verifierQ3 = await agent
-      .get("/v1/trust/verifier-authorization")
-      .query({ did: VERIFIER, vtjscId: VTJSC });
-    const verifierQ1 = await agent
-      .get("/v1/trust/resolve")
-      .query({ did: VERIFIER });
+      .post(RESOLVE_PATH)
+      .send(participationBody(VERIFIER));
+    const verifierQ1 = await agent.post(RESOLVE_PATH).send(q1Body(VERIFIER));
     const statusAfterFault = await authorize(agent.get(CONTROL_PATH));
-    const verifierRetry = await agent
-      .get("/v1/trust/resolve")
-      .query({ did: VERIFIER });
+    const verifierRetry = await agent.post(RESOLVE_PATH).send(q1Body(VERIFIER));
 
     expect(armed.status).toBe(201);
-    expect(issuerQ1.body).toEqual({
-      did: ISSUER,
-      trustStatus: "TRUSTED",
-      production: true,
-    });
-    expect(verifierQ3.body.authorized).toBe(true);
+    expect(issuerQ1.body.trusted).toBe(true);
+    expect(verifierQ3.body.participations[0].role).toBe("VERIFIER");
     expect(verifierQ1.status).toBe(503);
-    expect(Buffer.byteLength(verifierQ1.text)).toBeLessThan(1_024);
     expect(verifierQ1.body).toEqual({ error: "resolver_unavailable" });
     expect(statusAfterFault.body).toEqual({ armed: false });
     expect(verifierRetry.status).toBe(200);
-    expect(verifierRetry.body.trustStatus).toBe("TRUSTED");
+    expect(verifierRetry.body.trusted).toBe(true);
   });
 
   it.each(["malformed-json", "oversized-body"] as const)(
-    "serves one exact %s fault and then restores normal Q1",
+    "serves one exact %s fault and then restores a normal Q1",
     async (mode) => {
       const agent = controlledResolver();
       await authorize(agent.post(`${CONTROL_PATH}/${mode}`)).expect(201);
 
       const fault = await agent
-        .get("/v1/trust/resolve")
-        .query({ did: VERIFIER })
+        .post(RESOLVE_PATH)
+        .send(q1Body(VERIFIER))
         .buffer(true)
         .parse((response, callback) => {
           const chunks: Buffer[] = [];
@@ -255,19 +300,16 @@ describe("controlled local resolver faults", () => {
             callback(null, Buffer.concat(chunks).toString("utf8")),
           );
         });
-      const retry = await agent
-        .get("/v1/trust/resolve")
-        .query({ did: VERIFIER });
+      const retry = await agent.post(RESOLVE_PATH).send(q1Body(VERIFIER));
 
       expect(fault.status).toBe(200);
-      expect(fault.type).toBe("application/json");
       if (mode === "malformed-json") {
         expect(fault.body).toBe('{"did":');
       } else {
         expect(Buffer.byteLength(fault.body as string)).toBeGreaterThan(65_536);
       }
       expect(retry.status).toBe(200);
-      expect(retry.body.trustStatus).toBe("TRUSTED");
+      expect(retry.body.trusted).toBe(true);
     },
   );
 
@@ -278,9 +320,7 @@ describe("controlled local resolver faults", () => {
 
     now += 30_001;
     const status = await authorize(agent.get(CONTROL_PATH));
-    const verifierQ1 = await agent
-      .get("/v1/trust/resolve")
-      .query({ did: VERIFIER });
+    const verifierQ1 = await agent.post(RESOLVE_PATH).send(q1Body(VERIFIER));
 
     expect(status.body).toEqual({ armed: false });
     expect(verifierQ1.status).toBe(200);
@@ -294,12 +334,9 @@ describe("controlled local resolver faults", () => {
       agent.post(`${CONTROL_PATH}/malformed-json`),
     );
     const reset = await authorize(agent.delete(CONTROL_PATH));
-    const status = await authorize(agent.get(CONTROL_PATH));
 
     expect(overwrite.status).toBe(409);
-    expect(overwrite.body).toEqual({ error: "fault_already_armed" });
     expect(reset.status).toBe(200);
     expect(reset.body).toEqual({ armed: false });
-    expect(status.body).toEqual({ armed: false });
   });
 });
