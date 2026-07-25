@@ -205,7 +205,9 @@ export async function up(
     await runCompose(context, ["build", "issuer"]);
     await runCompose(context, [
       "up",
-      "-d",
+      "--wait",
+      "--wait-timeout",
+      "180",
       "--force-recreate",
       "keycloak",
       "issuer",

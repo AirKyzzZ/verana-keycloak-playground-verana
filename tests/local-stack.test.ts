@@ -47,6 +47,7 @@ interface FakeBehavior {
   failTwitterStart?: boolean;
   failTwitterStop?: boolean;
   failComposeBuild?: boolean;
+  failComposeWait?: boolean;
   containers?: readonly {
     id: string;
     project: string;
@@ -128,6 +129,14 @@ class FakeRunner implements CommandRunner {
       this.behavior.failComposeDown
     ) {
       return { exitCode: 1, stdout: "", stderr: "compose down failed" };
+    }
+    if (
+      command === "docker" &&
+      args.includes("up") &&
+      args.includes("--wait") &&
+      this.behavior.failComposeWait
+    ) {
+      return { exitCode: 1, stdout: "", stderr: "compose wait failed" };
     }
     if (
       this.behavior.failCommand?.every((value, index) => args[index] === value)
@@ -623,6 +632,143 @@ describe("guarded local controlled stack lifecycle", () => {
         "--volumes",
         "--remove-orphans",
       ],
+    ]);
+  });
+
+  it("waits for exact Compose health before semantic checks and host launch", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const events: string[] = [];
+    const deps = dependencies(runner, root);
+    const fetchImpl = deps.fetch;
+    const launch = deps.launch;
+    if (!fetchImpl || !launch) throw new Error("missing test dependency");
+    runner.onRun = (command, args) => {
+      if (command === "docker" && args.includes("up")) {
+        events.push("compose-wait");
+      }
+    };
+    deps.fetch = async (input, init) => {
+      const url = String(input);
+      if (
+        url ===
+        "http://127.0.0.1:8080/realms/verana-playground/.well-known/openid-configuration"
+      ) {
+        events.push("semantic-http");
+      }
+      if (url.endsWith("/protocol/openid-connect/token")) {
+        events.push("zero-user");
+      }
+      return await fetchImpl(input, init);
+    };
+    deps.launch = async (options) => {
+      events.push("host-launch");
+      return await launch(options);
+    };
+
+    await up(deps);
+
+    expect(runner.composeUpCalls()).toEqual([
+      [
+        "docker",
+        [
+          "compose",
+          "--project-name",
+          "verana-keycloak-local-controlled",
+          "--env-file",
+          ".data/local-controlled.env",
+          "-f",
+          "compose.yaml",
+          "-f",
+          "compose.local-controlled.yaml",
+          "up",
+          "--wait",
+          "--wait-timeout",
+          "180",
+          "--force-recreate",
+          "keycloak",
+          "issuer",
+          "holder",
+          "verifier",
+        ],
+      ],
+    ]);
+    expect(events).toEqual([
+      "compose-wait",
+      "semantic-http",
+      "zero-user",
+      "host-launch",
+    ]);
+  });
+
+  it("cleans generated state and restores Twitter when Compose wait fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      failComposeWait: true,
+      twitterRunning: true,
+    });
+    const fetchCalls: string[] = [];
+    let hostLaunched = false;
+    const deps = dependencies(runner, root, { fetchCalls });
+    deps.launch = async () => {
+      hostLaunched = true;
+      return { pid: 4242, startToken: "unexpected-host-launch" };
+    };
+
+    await expect(up(deps)).rejects.toThrow("docker compose");
+
+    expect(runner.composeUpCalls()).toEqual([
+      [
+        "docker",
+        [
+          "compose",
+          "--project-name",
+          "verana-keycloak-local-controlled",
+          "--env-file",
+          ".data/local-controlled.env",
+          "-f",
+          "compose.yaml",
+          "-f",
+          "compose.local-controlled.yaml",
+          "up",
+          "--wait",
+          "--wait-timeout",
+          "180",
+          "--force-recreate",
+          "keycloak",
+          "issuer",
+          "holder",
+          "verifier",
+        ],
+      ],
+    ]);
+    expect(runner.calls).toContainEqual([
+      "docker",
+      [
+        "compose",
+        "--project-name",
+        "verana-keycloak-local-controlled",
+        "--env-file",
+        ".data/local-controlled.env",
+        "-f",
+        "compose.yaml",
+        "-f",
+        "compose.local-controlled.yaml",
+        "down",
+        "--volumes",
+        "--remove-orphans",
+      ],
+    ]);
+    expect(fetchCalls).toEqual([]);
+    expect(hostLaunched).toBe(false);
+    await expect(readdir(join(root, ".data"))).resolves.toEqual([]);
+    expect(runner.calls).toContainEqual([
+      "docker",
+      ["stop", "twitter-bot-vs-agent"],
+    ]);
+    expect(runner.calls).toContainEqual([
+      "docker",
+      ["start", "twitter-bot-vs-agent"],
     ]);
   });
 
