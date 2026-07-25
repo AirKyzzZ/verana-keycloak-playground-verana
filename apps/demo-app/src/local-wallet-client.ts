@@ -43,14 +43,29 @@ const evidenceSchema = z.strictObject({
   note: z.string().max(500).optional(),
 });
 
+// A refused review carries an empty gate id: the agent mints a gate only for an
+// exact TRUSTED_AUTHORIZED verdict.
+const gateIdSchema = z.string().trim().max(MAX_IDENTIFIER_LENGTH);
+
+const reviewedOfferSchema = z.strictObject({
+  gateId: gateIdSchema,
+  verdict: verdictSchema,
+  issuerDid: z.string().max(MAX_URL_LENGTH).nullable(),
+  credentialIssuer: z.string().max(MAX_URL_LENGTH),
+  evidence: evidenceSchema,
+});
+
 const resolvedPresentationSchema = z.strictObject({
-  gateId: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
+  gateId: gateIdSchema,
   verdict: verdictSchema,
   evidence: evidenceSchema,
   request: z.strictObject({
     clientId: z.string().trim().min(1).max(MAX_URL_LENGTH),
     clientIdPrefix: z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH),
     verifierDid: z.string().max(MAX_URL_LENGTH).nullable(),
+    // Present but never authenticated: the DID a request merely claims, which
+    // must never be treated as identity.
+    unverifiedClaimedDid: z.string().max(MAX_URL_LENGTH).nullable(),
     requestedVct: z.string().max(MAX_URL_LENGTH).nullable(),
     requestedClaims: z
       .array(z.string().max(MAX_IDENTIFIER_LENGTH))
@@ -86,6 +101,7 @@ const sharedPresentationSchema = z.strictObject({
 });
 
 export type VeranaVerdict = z.infer<typeof verdictSchema>;
+export type ReviewedOffer = z.infer<typeof reviewedOfferSchema>;
 export type ResolvedPresentation = z.infer<typeof resolvedPresentationSchema>;
 export type PresentationRequest = z.infer<typeof presentationRequestSchema>;
 export type PresentationStatus = z.infer<typeof presentationStatusSchema>;
@@ -109,7 +125,8 @@ export interface LocalWalletClientConfig {
 }
 
 export interface LocalWalletClientContract {
-  acceptOffer(credentialOffer: string): Promise<AcceptedBadge>;
+  reviewOffer(credentialOffer: string): Promise<ReviewedOffer>;
+  acceptOffer(reviewed: ReviewedOffer): Promise<AcceptedBadge>;
   createPresentationRequest(): Promise<PresentationRequest>;
   getPresentationStatus(sessionId: string): Promise<PresentationStatus>;
   issueBadge(subjectId: string): Promise<IssuedBadge>;
@@ -149,13 +166,30 @@ export class LocalWalletClient implements LocalWalletClientContract {
     };
   }
 
-  async acceptOffer(credentialOffer: string): Promise<AcceptedBadge> {
+  async reviewOffer(credentialOffer: string): Promise<ReviewedOffer> {
+    return await this.#request(
+      this.#holderBaseUrl,
+      "/oid4vc-demo/wallet/review-offer",
+      {
+        method: "POST",
+        body: JSON.stringify({ credentialOffer }),
+      },
+      reviewedOfferSchema,
+    );
+  }
+
+  // Acceptance is gated on the review verdict, so a refused issuer never reaches
+  // the token request or credential storage.
+  async acceptOffer(reviewed: ReviewedOffer): Promise<AcceptedBadge> {
+    if (reviewed.verdict !== "TRUSTED_AUTHORIZED" || !reviewed.gateId) {
+      throw new Error("issuer_not_authorized");
+    }
     const response = await this.#request(
       this.#holderBaseUrl,
       "/oid4vc-demo/wallet/accept-offer",
       {
         method: "POST",
-        body: JSON.stringify({ credentialOffer }),
+        body: JSON.stringify({ gateId: reviewed.gateId }),
       },
       acceptedBadgeResponseSchema,
     );

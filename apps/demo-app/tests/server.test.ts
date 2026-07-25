@@ -13,6 +13,7 @@ import type {
   AcceptedBadge,
   IssuedBadge,
   ResolvedPresentation,
+  ReviewedOffer,
   SharedPresentation,
 } from "../src/local-wallet-client.js";
 import { createDemoServer, type DemoServerOptions } from "../src/server.js";
@@ -64,6 +65,20 @@ const acceptedBadge: AcceptedBadge = {
   vct: "https://issuer.example/vct",
 };
 
+const positiveOfferReview: ReviewedOffer = {
+  gateId: "gate-issuance-1",
+  verdict: "TRUSTED_AUTHORIZED",
+  issuerDid: "did:webvh:test:issuer",
+  credentialIssuer: "https://issuer.example/oid4vci/unfold",
+  evidence: {
+    did: "did:webvh:test:issuer",
+    trustStatus: "TRUSTED",
+    authorized: true,
+    vtjscId: "https://issuer.example/schema.json",
+    queries: ["https://resolver.example/v4/verifiable-trust/resolve"],
+  },
+};
+
 const positiveResolution: ResolvedPresentation = {
   gateId: "gate-trusted-1",
   verdict: "TRUSTED_AUTHORIZED",
@@ -78,25 +93,27 @@ const positiveResolution: ResolvedPresentation = {
     clientId: "x509_hash:verifier",
     clientIdPrefix: "x509_hash",
     verifierDid: "did:webvh:test:verifier",
+    unverifiedClaimedDid: "did:webvh:test:verifier",
     requestedVct: "https://issuer.example/vct",
     requestedClaims: ["subject_id", "organization", "role"],
   },
 };
 
 const exactRogueDenial: ResolvedPresentation = {
-  gateId: "gate-rogue-sensitive",
+  gateId: "",
   verdict: "UNTRUSTED",
   evidence: {
-    did: CONTROLLED_ROGUE_DID,
-    trustStatus: "UNTRUSTED",
+    did: null,
+    trustStatus: null,
     authorized: null,
     vtjscId: CONTROLLED_VTJSC,
-    queries: [`${CONTROLLED_RESOLVER}/resolve?did=did%3Aweb%3Arogue.localhost`],
+    queries: [],
   },
   request: {
     clientId: "x509_hash:rogue-verifier",
     clientIdPrefix: "x509_hash",
-    verifierDid: CONTROLLED_ROGUE_DID,
+    verifierDid: null,
+    unverifiedClaimedDid: CONTROLLED_ROGUE_DID,
     requestedVct: CONTROLLED_VCT,
     requestedClaims: ["subject_id", "organization", "role"],
   },
@@ -112,6 +129,7 @@ function createOptions(
   };
   walletClient: DemoServerOptions["walletClient"] & {
     acceptOffer: ReturnType<typeof vi.fn>;
+    reviewOffer: ReturnType<typeof vi.fn>;
     issueBadge: ReturnType<typeof vi.fn>;
     resolveRequest: ReturnType<typeof vi.fn>;
     share: ReturnType<typeof vi.fn>;
@@ -124,6 +142,7 @@ function createOptions(
   }));
   const exchangeCallback = vi.fn(async () => identity);
   const issueBadge = vi.fn(async () => issuedBadge);
+  const reviewOffer = vi.fn(async () => positiveOfferReview);
   const acceptOffer = vi.fn(async () =>
     evidenceMode === "LOCAL_CONTROLLED"
       ? { ...acceptedBadge, subjectId: "local-controlled-user" }
@@ -153,6 +172,7 @@ function createOptions(
     },
     walletClient: {
       acceptOffer,
+      reviewOffer,
       createPresentationRequest: vi.fn(),
       getPresentationStatus: vi.fn(),
       issueBadge,
@@ -743,7 +763,10 @@ describe("local-holder routes", () => {
       "resolver evidence",
       {
         ...exactRogueDenial,
-        evidence: { ...exactRogueDenial.evidence, queries: [] },
+        evidence: {
+          ...exactRogueDenial.evidence,
+          queries: ["https://resolver.example/v4/verifiable-trust/resolve"],
+        },
       },
     ],
   ])("fails closed on rogue denial drift in %s", async (_name, resolution) => {
@@ -965,8 +988,13 @@ describe("local-holder routes", () => {
     }).expect(200);
 
     expect(options.walletClient.issueBadge).toHaveBeenCalledWith("local-user");
-    expect(options.walletClient.acceptOffer).toHaveBeenCalledWith(
+    // The offer is reviewed first, and acceptance is driven by that review's
+    // gate rather than by the raw offer.
+    expect(options.walletClient.reviewOffer).toHaveBeenCalledWith(
       issuedBadge.credentialOffer,
+    );
+    expect(options.walletClient.acceptOffer).toHaveBeenCalledWith(
+      positiveOfferReview,
     );
     expect(response.text).toContain("credential-1");
     expect(response.text).not.toContain(issuedBadge.credentialOffer);

@@ -45,6 +45,27 @@ const MAXIMUM_REQUEST_BYTES = 64 * 1024;
 interface ResolveRequest {
   did: string;
   withParticipations: boolean;
+  withEcsCredentials: boolean;
+  withServices: boolean;
+  withPresentations: boolean;
+  withPresentationCredentialIds: boolean;
+  withEcosystems: boolean;
+}
+
+// Every selector defaults to false, and an explicit `false` must exclude the
+// section just as an omitted selector does.
+function selectorEnabled(value: unknown): boolean {
+  if (value === true) return true;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// `true` is sugar for `{}`, which sets no sub-flags, so only the object form
+// with the named flag set counts.
+function subSelectorEnabled(value: unknown, name: string): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  return (value as Record<string, unknown>)[name] === true;
 }
 
 // Koa 3 ships no body parser and the plan forbids a new dependency, so the
@@ -71,7 +92,14 @@ function parseResolveRequest(body: unknown): ResolveRequest | undefined {
   if (typeof did !== "string" || !did.startsWith("did:")) return undefined;
   return {
     did,
-    withParticipations: Object.hasOwn(record, "participations"),
+    withParticipations: selectorEnabled(record.participations),
+    withEcsCredentials: record.ecsCredentials === true,
+    withServices: record.services === true,
+    withPresentations: selectorEnabled(record.presentations),
+    withPresentationCredentialIds:
+      subSelectorEnabled(record.presentations, "unresolvableCredentialIds") &&
+      subSelectorEnabled(record.presentations, "invalidCredentialIds"),
+    withEcosystems: selectorEnabled(record.ecosystems),
   };
 }
 

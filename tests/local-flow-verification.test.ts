@@ -18,9 +18,7 @@ const VTJSC = "https://issuer.example/vt/badge.json";
 const SUBJECT = "call-demo-user";
 const CONTROLLED_SUBJECT = "local-controlled-user";
 const SENSITIVE_MARKER = "raw-secret-presentation-token";
-const ROGUE_Q1_QUERY = `${LOCAL_CONTROLLED.resolverUrl}/resolve?did=${encodeURIComponent(
-  LOCAL_CONTROLLED.rogueDid,
-)}`;
+const RESOLVER_RESOLVE_QUERY = `${LOCAL_CONTROLLED.resolverUrl}/v4/verifiable-trust/resolve`;
 
 interface FakeBehavior {
   capability?: {
@@ -30,15 +28,17 @@ interface FakeBehavior {
   };
   capabilityExtra?: boolean;
   failWithSensitiveBody?: boolean;
-  includeResolverMetadata?: boolean;
   issuerQ1Did?: string;
   issuerQ1Extra?: boolean;
-  issuerQ1Production?: boolean;
-  issuerQ1TrustStatus?: string;
-  issuerQ2Authorized?: unknown;
+  issuerQ1Participations?: boolean;
+  issuerQ1Trusted?: boolean;
+  issuerQ2Authorized?: boolean;
   issuerQ2Did?: string;
   issuerQ2Extra?: boolean;
-  issuerQ2Vtjsc?: string;
+  issuerQ2ParticipationsNotArray?: boolean;
+  issuerQ2Role?: string;
+  issuerQ2SchemaId?: number;
+  issuerQ2State?: string;
   keycloakUsers?: number;
   malformedJsonAt?: "resolver" | "verifier";
   mediaTypeAt?: "resolver" | "verifier";
@@ -63,14 +63,16 @@ interface FakeBehavior {
   receiptVtjsc?: string;
   sessionNeverCompletes?: boolean;
   shareTimeout?: boolean;
-  rogueAuthorized?: boolean | null;
-  rogueEvidenceDid?: string | null;
-  rogueEvidenceTrustStatus?: string | null;
+  rogueAuthorized?: boolean;
+  rogueEvidenceDid?: string;
+  rogueEvidenceTrustStatus?: string;
   rogueEvidenceVtjsc?: string | null;
+  rogueGateId?: string;
   rogueQueries?: string[];
   rogueRequestedClaims?: string[];
   rogueRequestedVct?: string | null;
-  rogueRequestVerifierDid?: string | null;
+  rogueRequestVerifierDid?: string;
+  rogueUnverifiedClaimedDid?: string | null;
   rogueVerdict?: string;
   trustedResolutionVerdict?: string;
   acceptedClaims?: {
@@ -90,11 +92,10 @@ interface FakeBehavior {
     >
   >;
   verifierQ1Did?: string;
-  verifierQ1Production?: boolean;
-  verifierQ1TrustStatus?: string;
+  verifierQ1Trusted?: boolean;
   verifierQ3Authorized?: boolean;
   verifierQ3Did?: string;
-  verifierQ3Vtjsc?: string;
+  verifierQ3EcosystemId?: number;
 }
 
 interface FakeServices {
@@ -163,17 +164,18 @@ describe("local flow verification", () => {
 
   it.each([
     ["issuer Q1 DID", { issuerQ1Did: "did:web:other.example" }],
-    ["issuer Q1 trust", { issuerQ1TrustStatus: "PARTIAL" }],
-    ["issuer Q1 production", { issuerQ1Production: false }],
+    ["issuer Q1 trust", { issuerQ1Trusted: false }],
+    ["issuer Q1 unsolicited participations", { issuerQ1Participations: true }],
     ["issuer Q2 DID", { issuerQ2Did: "did:web:other.example" }],
-    ["issuer Q2 VTJSC", { issuerQ2Vtjsc: "https://other.example/schema" }],
+    ["issuer Q2 credential schema", { issuerQ2SchemaId: 250 }],
+    ["issuer Q2 participation state", { issuerQ2State: "PENDING" }],
+    ["issuer Q2 participation role", { issuerQ2Role: "VERIFIER" }],
     ["issuer Q2 authorization", { issuerQ2Authorized: false }],
-    ["issuer Q2 authorization type", { issuerQ2Authorized: "true" }],
+    ["issuer Q2 participations type", { issuerQ2ParticipationsNotArray: true }],
     ["verifier Q1 DID", { verifierQ1Did: "did:web:other.example" }],
-    ["verifier Q1 trust", { verifierQ1TrustStatus: "UNTRUSTED" }],
-    ["verifier Q1 production", { verifierQ1Production: false }],
+    ["verifier Q1 trust", { verifierQ1Trusted: false }],
     ["verifier Q3 DID", { verifierQ3Did: "did:web:other.example" }],
-    ["verifier Q3 VTJSC", { verifierQ3Vtjsc: "https://other.example/schema" }],
+    ["verifier Q3 ecosystem", { verifierQ3EcosystemId: 185 }],
     ["verifier Q3 authorization", { verifierQ3Authorized: false }],
   ])("fails closed on an inexact %s response", async (_name, behavior) => {
     const services = await startFakeServices(behavior);
@@ -214,22 +216,6 @@ describe("local flow verification", () => {
       expect(services.issues()).toBe(0);
     },
   );
-
-  it("accepts only the documented bounded resolver metadata", async () => {
-    const services = await startFakeServices({
-      includeResolverMetadata: true,
-    });
-    const lines: string[] = [];
-
-    await expect(
-      runLocalFlow(flowConfig(services.baseUrl), {
-        sleep: async () => undefined,
-        write: (line) => lines.push(line),
-      }),
-    ).resolves.toBe(0);
-
-    expect(lines.at(-1)).toBe("PASS");
-  });
 
   it.each([
     [
@@ -372,7 +358,7 @@ describe("local flow verification", () => {
       "resolver URL",
       (config: LocalFlowConfig) => ({
         ...config,
-        resolverUrl: "http://localhost:3098/v1/trust",
+        resolverUrl: `${LOCAL_CONTROLLED.resolverUrl}/v4/verifiable-trust`,
       }),
     ],
     [
@@ -631,8 +617,8 @@ describe("local flow verification", () => {
   it.each([
     ["resolver unavailable", { resolverUnavailable: true }],
     ["wrong Q1 DID", { issuerQ1Did: "did:web:wrong.localhost" }],
-    ["production false", { issuerQ1Production: false }],
-    ["wrong Q2 VTJSC", { issuerQ2Vtjsc: "https://wrong.example/vtjsc.json" }],
+    ["untrusted Q1", { issuerQ1Trusted: false }],
+    ["wrong Q2 credential schema", { issuerQ2SchemaId: 250 }],
     ["wrong Q3 DID", { verifierQ3Did: "did:web:wrong.localhost" }],
     ["resolver malformed JSON", { malformedJsonAt: "resolver" as const }],
     ["resolver invalid UTF-8", { invalidUtf8At: "resolver" as const }],
@@ -671,22 +657,38 @@ describe("local flow verification", () => {
   });
 
   it.each([
+    ["a minted gate", { rogueGateId: "gate-rogue" }],
     [
-      "wrong request DID",
+      "an authenticated request DID",
+      { rogueRequestVerifierDid: LOCAL_CONTROLLED.rogueDid },
+    ],
+    [
+      "a wrong request DID",
       { rogueRequestVerifierDid: "did:web:wrong.localhost" },
     ],
-    ["missing request DID", { rogueRequestVerifierDid: null }],
-    ["wrong evidence DID", { rogueEvidenceDid: "did:web:wrong.localhost" }],
-    ["missing evidence DID", { rogueEvidenceDid: null }],
+    [
+      "a wrong claimed DID",
+      { rogueUnverifiedClaimedDid: "did:web:wrong.localhost" },
+    ],
+    ["a missing claimed DID", { rogueUnverifiedClaimedDid: null }],
+    [
+      "a resolved evidence DID",
+      { rogueEvidenceDid: LOCAL_CONTROLLED.rogueDid },
+    ],
     ["TRUSTED evidence", { rogueEvidenceTrustStatus: "TRUSTED" }],
-    ["false authorization result", { rogueAuthorized: false }],
-    ["unexpected authorization", { rogueAuthorized: true }],
-    ["wrong VTJSC", { rogueEvidenceVtjsc: "https://wrong.example/vtjsc.json" }],
-    ["missing VTJSC", { rogueEvidenceVtjsc: null }],
-    ["wrong VCT", { rogueRequestedVct: "https://wrong.example/vct" }],
+    ["UNTRUSTED evidence", { rogueEvidenceTrustStatus: "UNTRUSTED" }],
+    ["a false authorization result", { rogueAuthorized: false }],
+    ["an unexpected authorization", { rogueAuthorized: true }],
+    [
+      "a wrong VTJSC",
+      { rogueEvidenceVtjsc: "https://wrong.example/vtjsc.json" },
+    ],
+    ["a missing VTJSC", { rogueEvidenceVtjsc: null }],
+    ["a wrong VCT", { rogueRequestedVct: "https://wrong.example/vct" }],
+    ["a missing VCT", { rogueRequestedVct: null }],
     ["wrong claims", { rogueRequestedClaims: ["subject_id", "organization"] }],
-    ["non-Q1 resolver queries", { rogueQueries: [] }],
-    ["different denial verdict", { rogueVerdict: "TRUSTED_NOT_AUTHORIZED" }],
+    ["resolver queries", { rogueQueries: [RESOLVER_RESOLVE_QUERY] }],
+    ["a different denial verdict", { rogueVerdict: "TRUSTED_NOT_AUTHORIZED" }],
   ])("rejects rogue denial with %s", async (_name, behavior) => {
     const services = await startFakeServices(behavior);
     const { lines, result } = await runControlledFlow(services);
@@ -709,6 +711,8 @@ function flowConfig(baseUrl: string): LocalFlowConfig {
     expectedVerifierDid: VERIFIER_DID,
     expectedVct: VCT,
     expectedVtjscId: VTJSC,
+    expectedEcosystemId: LOCAL_CONTROLLED.ecosystemId,
+    expectedCredentialSchemaId: LOCAL_CONTROLLED.credentialSchemaId,
     holderBaseUrl: `${baseUrl}/holder`,
     issuerBaseUrl: `${baseUrl}/issuer`,
     keycloakIssuer: `${baseUrl}/keycloak`,
@@ -730,13 +734,15 @@ function controlledFlowConfig(): LocalFlowConfig {
     expectedVerifierDid: LOCAL_CONTROLLED.verifierDid,
     expectedVct: LOCAL_CONTROLLED.vct,
     expectedVtjscId: LOCAL_CONTROLLED.vtjscId,
+    expectedEcosystemId: LOCAL_CONTROLLED.ecosystemId,
+    expectedCredentialSchemaId: LOCAL_CONTROLLED.credentialSchemaId,
     holderBaseUrl: "http://localhost:3111",
     issuerBaseUrl: "http://localhost:3101",
     keycloakIssuer: "http://localhost:8080/realms/verana-playground",
     pairwiseSubSecret: new TextEncoder().encode(
       "test-secret-at-least-32-bytes-long",
     ),
-    resolverUrl: "http://localhost:3099/v1/trust",
+    resolverUrl: LOCAL_CONTROLLED.resolverUrl,
     sectorIdentifier: "verana-playground",
     verifierBaseUrl: "http://localhost:3201",
   };
@@ -801,10 +807,8 @@ async function startFakeServices(
     ) {
       keycloakUnexpectedRequestCount += 1;
     }
-    const did = url.searchParams.get("did");
-    const vtjscId = url.searchParams.get("vtjscId");
-
-    if (url.pathname === "/trust/resolve") {
+    if (url.pathname === "/trust/v4/verifiable-trust/resolve") {
+      const resolveBody = await readJson(request);
       if (behavior.resolverUnavailable) {
         json(response, 503, { error: "resolver_unavailable" });
         return;
@@ -837,72 +841,40 @@ async function startFakeServices(
         );
         return;
       }
-      const issuer = did === ISSUER_DID;
-      const controlledIssuer = did === LOCAL_CONTROLLED.issuerDid;
-      const expectedDid = controlledIssuer
-        ? LOCAL_CONTROLLED.issuerDid
-        : did === LOCAL_CONTROLLED.verifierDid
-          ? LOCAL_CONTROLLED.verifierDid
-          : issuer
-            ? ISSUER_DID
-            : VERIFIER_DID;
+
+      const requestedDid =
+        typeof resolveBody.did === "string" ? resolveBody.did : "";
+      const wantsParticipations = Object.hasOwn(resolveBody, "participations");
+      const isIssuer =
+        requestedDid === ISSUER_DID ||
+        requestedDid === LOCAL_CONTROLLED.issuerDid;
+      const trusted = isIssuer
+        ? (behavior.issuerQ1Trusted ?? true)
+        : (behavior.verifierQ1Trusted ?? true);
+      const reportedDid = wantsParticipations
+        ? isIssuer
+          ? (behavior.issuerQ2Did ?? requestedDid)
+          : (behavior.verifierQ3Did ?? requestedDid)
+        : isIssuer
+          ? (behavior.issuerQ1Did ?? requestedDid)
+          : (behavior.verifierQ1Did ?? requestedDid);
+
       json(response, 200, {
-        did:
-          issuer || controlledIssuer
-            ? (behavior.issuerQ1Did ?? expectedDid)
-            : (behavior.verifierQ1Did ?? expectedDid),
-        trustStatus:
-          issuer || controlledIssuer
-            ? (behavior.issuerQ1TrustStatus ?? "TRUSTED")
-            : (behavior.verifierQ1TrustStatus ?? "TRUSTED"),
-        production:
-          issuer || controlledIssuer
-            ? (behavior.issuerQ1Production ?? true)
-            : (behavior.verifierQ1Production ?? true),
-        ...(behavior.includeResolverMetadata
-          ? {
-              evaluatedAt: "2026-07-24T17:38:31.649Z",
-              evaluatedAtBlock: 4_488_868,
-              expiresAt: "2026-07-24T18:38:31.649Z",
-            }
+        did: reportedDid,
+        trusted,
+        evaluatedAtTime: "2026-07-25T17:38:31Z",
+        evaluatedAtBlock: 4_488_868,
+        expiresAtTime: null,
+        corporationId: 1,
+        ecsCredentials: [],
+        presentations: [],
+        services: [],
+        ecosystems: [],
+        ...(wantsParticipations || (isIssuer && behavior.issuerQ1Participations)
+          ? { participations: participations(isIssuer, behavior) }
           : {}),
-        ...((issuer || controlledIssuer) && behavior.issuerQ1Extra
+        ...(extraField(isIssuer, wantsParticipations, behavior)
           ? { undocumented: "reject-me" }
-          : {}),
-      });
-      return;
-    }
-    if (url.pathname === "/trust/issuer-authorization") {
-      json(response, 200, {
-        did: behavior.issuerQ2Did ?? did,
-        vtjscId: behavior.issuerQ2Vtjsc ?? vtjscId,
-        authorized: behavior.issuerQ2Authorized ?? true,
-        ...(behavior.includeResolverMetadata
-          ? {
-              evaluatedAt: "2026-07-24T17:46:35.631Z",
-              evaluatedAtBlock: {},
-              fees: {},
-              permission: {},
-              permissionChain: {},
-            }
-          : {}),
-        ...(behavior.issuerQ2Extra ? { undocumented: "reject-me" } : {}),
-      });
-      return;
-    }
-    if (url.pathname === "/trust/verifier-authorization") {
-      json(response, 200, {
-        did: behavior.verifierQ3Did ?? did,
-        vtjscId: behavior.verifierQ3Vtjsc ?? vtjscId,
-        authorized: behavior.verifierQ3Authorized ?? true,
-        ...(behavior.includeResolverMetadata
-          ? {
-              evaluatedAt: "2026-07-24T17:46:37.578Z",
-              evaluatedAtBlock: {},
-              fees: {},
-              permission: {},
-              permissionChain: {},
-            }
           : {}),
       });
       return;
@@ -1107,30 +1079,27 @@ async function startFakeServices(
     ) {
       const body = await readJson(request);
       const rogue = body.authorizationRequest === "rogue-request";
-      const gateId =
-        !rogue && behavior.replaySecondGate && trustedRequestCount === 2
+      const controlled = controlledRequest(request);
+      const verifierDid = controlled
+        ? LOCAL_CONTROLLED.verifierDid
+        : VERIFIER_DID;
+      const vtjscId = controlled ? LOCAL_CONTROLLED.vtjscId : VTJSC;
+      const vct = controlled ? LOCAL_CONTROLLED.vct : VCT;
+      // A refused review mints no gate, so the rogue gate id is empty.
+      const gateId = rogue
+        ? (behavior.rogueGateId ?? "")
+        : behavior.replaySecondGate && trustedRequestCount === 2
           ? "gate-1"
-          : rogue
-            ? "gate-rogue"
-            : `gate-${trustedRequestCount}`;
-      const rogueEvidenceDid = hasOwn(behavior, "rogueEvidenceDid")
-        ? behavior.rogueEvidenceDid
-        : LOCAL_CONTROLLED.rogueDid;
-      const rogueRequestVerifierDid = hasOwn(
-        behavior,
-        "rogueRequestVerifierDid",
-      )
-        ? behavior.rogueRequestVerifierDid
-        : LOCAL_CONTROLLED.rogueDid;
-      const rogueAuthorized = hasOwn(behavior, "rogueAuthorized")
-        ? behavior.rogueAuthorized
-        : null;
+          : `gate-${trustedRequestCount}`;
       const rogueEvidenceVtjsc = hasOwn(behavior, "rogueEvidenceVtjsc")
         ? behavior.rogueEvidenceVtjsc
-        : LOCAL_CONTROLLED.vtjscId;
+        : vtjscId;
       const rogueRequestedVct = hasOwn(behavior, "rogueRequestedVct")
         ? behavior.rogueRequestedVct
-        : LOCAL_CONTROLLED.vct;
+        : vct;
+      const rogueClaimedDid = hasOwn(behavior, "rogueUnverifiedClaimedDid")
+        ? behavior.rogueUnverifiedClaimedDid
+        : LOCAL_CONTROLLED.rogueDid;
       json(response, 200, {
         gateId,
         verdict: rogue
@@ -1138,34 +1107,29 @@ async function startFakeServices(
           : (behavior.trustedResolutionVerdict ?? "TRUSTED_AUTHORIZED"),
         evidence: {
           did: rogue
-            ? rogueEvidenceDid
-            : (behavior.resolutionEvidenceDid ??
-              (controlledRequest(request)
-                ? LOCAL_CONTROLLED.verifierDid
-                : VERIFIER_DID)),
+            ? (behavior.rogueEvidenceDid ?? null)
+            : (behavior.resolutionEvidenceDid ?? verifierDid),
           trustStatus: rogue
-            ? (behavior.rogueEvidenceTrustStatus ?? "UNTRUSTED")
+            ? (behavior.rogueEvidenceTrustStatus ?? null)
             : "TRUSTED",
-          authorized: rogue ? rogueAuthorized : true,
+          authorized: rogue ? (behavior.rogueAuthorized ?? null) : true,
           vtjscId: rogue
             ? rogueEvidenceVtjsc
-            : (behavior.resolutionEvidenceVtjsc ??
-              (controlledRequest(request) ? LOCAL_CONTROLLED.vtjscId : VTJSC)),
-          queries: rogue ? (behavior.rogueQueries ?? [ROGUE_Q1_QUERY]) : [],
+            : (behavior.resolutionEvidenceVtjsc ?? vtjscId),
+          queries: rogue ? (behavior.rogueQueries ?? []) : [],
         },
         request: {
           clientId: "x509_san_dns:verifier.example",
           clientIdPrefix: "x509_san_dns",
           verifierDid: rogue
-            ? rogueRequestVerifierDid
-            : (behavior.resolutionVerifierDid ??
-              (controlledRequest(request)
-                ? LOCAL_CONTROLLED.verifierDid
-                : VERIFIER_DID)),
+            ? (behavior.rogueRequestVerifierDid ?? null)
+            : (behavior.resolutionVerifierDid ?? verifierDid),
+          unverifiedClaimedDid: rogue
+            ? rogueClaimedDid
+            : (behavior.resolutionVerifierDid ?? verifierDid),
           requestedVct: rogue
             ? rogueRequestedVct
-            : (behavior.resolutionRequestedVct ??
-              (controlledRequest(request) ? LOCAL_CONTROLLED.vct : VCT)),
+            : (behavior.resolutionRequestedVct ?? vct),
           requestedClaims: rogue
             ? (behavior.rogueRequestedClaims ?? [
                 "subject_id",
@@ -1437,6 +1401,43 @@ function writeFaultResponse(
   return false;
 }
 
+function participations(isIssuer: boolean, behavior: FakeBehavior): unknown {
+  if (isIssuer && behavior.issuerQ2ParticipationsNotArray) {
+    return { "0": "ISSUER" };
+  }
+  const authorized = isIssuer
+    ? (behavior.issuerQ2Authorized ?? true)
+    : (behavior.verifierQ3Authorized ?? true);
+  if (!authorized) return [];
+  return [
+    {
+      id: isIssuer ? 2 : 3,
+      vsOperator: "verana1localcontrolledoperator",
+      role: isIssuer ? (behavior.issuerQ2Role ?? "ISSUER") : "VERIFIER",
+      state: isIssuer ? (behavior.issuerQ2State ?? "ACTIVE") : "ACTIVE",
+      credentialSchemaId: isIssuer
+        ? (behavior.issuerQ2SchemaId ?? LOCAL_CONTROLLED.credentialSchemaId)
+        : LOCAL_CONTROLLED.credentialSchemaId,
+      ecosystemId: isIssuer
+        ? LOCAL_CONTROLLED.ecosystemId
+        : (behavior.verifierQ3EcosystemId ?? LOCAL_CONTROLLED.ecosystemId),
+      weight: "100uvna",
+      validatorParticipantId: 1,
+    },
+  ];
+}
+
+function extraField(
+  isIssuer: boolean,
+  wantsParticipations: boolean,
+  behavior: FakeBehavior,
+): boolean {
+  if (!isIssuer) return false;
+  return wantsParticipations
+    ? behavior.issuerQ2Extra === true
+    : behavior.issuerQ1Extra === true;
+}
+
 function controlledRequest(request: IncomingMessage): boolean {
   return request.headers["x-fixture-controlled"] === "true";
 }
@@ -1479,21 +1480,17 @@ function mapControlledUrl(
   const routes = new Map([
     ["localhost:3000", "/demo"],
     ["localhost:3001", "/broker"],
-    ["localhost:3099", "/trust"],
     ["localhost:3101", "/issuer"],
     ["localhost:3111", "/holder"],
     ["localhost:3201", "/verifier"],
     ["localhost:8080", "/keycloak"],
+    ["resolver.localhost:3443", "/trust"],
   ]);
   const prefix = routes.get(url.host);
   if (!prefix) return { controlled: false, url };
 
   const mapped = new URL(fixtureBaseUrl);
-  const resolverPath =
-    prefix === "/trust" && url.pathname.startsWith("/v1/trust/")
-      ? url.pathname.slice("/v1/trust".length)
-      : url.pathname;
-  mapped.pathname = `${prefix}${resolverPath}`;
+  mapped.pathname = `${prefix}${url.pathname}`;
   mapped.search = url.search;
   return { controlled: true, url: mapped };
 }

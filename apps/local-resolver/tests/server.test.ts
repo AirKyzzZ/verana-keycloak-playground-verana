@@ -70,7 +70,9 @@ describe("controlled local v4 trust resolver", () => {
     expect(response.body.did).toBe(did);
     expect(response.body.trusted).toBe(true);
     expect(response.body.evaluatedAtTime).toMatch(UTC_PATTERN);
-    expect(response.body.expiresAtTime).toBeNull();
+    // Not null: the ECS credentials carry validUntil, so the boundary set is
+    // non-empty and expiresAtTime is its minimum.
+    expect(response.body.expiresAtTime).toMatch(UTC_PATTERN);
   });
 
   it("omits participations from a Q1 response and includes them for Q2", async () => {
@@ -430,8 +432,78 @@ describe("ecosystem DID document and Linked VP", () => {
       resolver().get("/presentations/2-vtjsc-vp.jwt"),
     ]);
 
-    const endpoint = trust.body.services[0].serviceEndpoint as string;
-    expect(endpoint).toContain("/presentations/2-vtjsc-vp.jwt");
+    expect(trust.body.presentations[0].id).toContain(
+      "/presentations/2-vtjsc-vp.jwt",
+    );
+    // services[] must carry only non-LinkedVerifiablePresentation entries.
+    for (const service of trust.body.services as { type: string }[]) {
+      expect(service.type).not.toBe("LinkedVerifiablePresentation");
+    }
     expect(presentation.status).toBe(200);
+  });
+});
+
+describe("v4 request selectors", () => {
+  it("omits every optional section when no selector is sent", async () => {
+    const response = await resolver().post(RESOLVE_PATH).send({ did: ISSUER });
+
+    expect(Object.keys(response.body).sort()).toEqual(
+      [
+        "corporationId",
+        "did",
+        "evaluatedAtBlock",
+        "evaluatedAtTime",
+        "expiresAtTime",
+        "trusted",
+      ].sort(),
+    );
+  });
+
+  it("treats an explicit false selector as exclusion", async () => {
+    const response = await resolver().post(RESOLVE_PATH).send({
+      did: ISSUER,
+      participations: false,
+      ecsCredentials: false,
+      services: false,
+      presentations: false,
+      ecosystems: false,
+    });
+
+    expect(Object.hasOwn(response.body, "participations")).toBe(false);
+    expect(Object.hasOwn(response.body, "ecsCredentials")).toBe(false);
+    expect(Object.hasOwn(response.body, "services")).toBe(false);
+    expect(Object.hasOwn(response.body, "presentations")).toBe(false);
+    expect(Object.hasOwn(response.body, "ecosystems")).toBe(false);
+  });
+
+  it("surfaces credential-id sub-flags only when both are requested", async () => {
+    const [withFlags, withoutFlags] = await Promise.all([
+      resolver().post(RESOLVE_PATH).send(q1Body(ISSUER)),
+      resolver().post(RESOLVE_PATH).send({ did: ISSUER, presentations: true }),
+    ]);
+
+    const flagged = withFlags.body.presentations[0];
+    const plain = withoutFlags.body.presentations[0];
+    expect(flagged.unresolvableCredentialIds).toEqual([]);
+    expect(flagged.invalidCredentialIds).toEqual([]);
+    expect(Object.hasOwn(plain, "unresolvableCredentialIds")).toBe(false);
+    expect(Object.hasOwn(plain, "invalidCredentialIds")).toBe(false);
+  });
+
+  it("gives each ECS credential type its own schema and participant ids", async () => {
+    const response = await resolver().post(RESOLVE_PATH).send(q1Body(ISSUER));
+
+    const [service, organization] = response.body.ecsCredentials as {
+      credentialSchemaId: number;
+      participantId: number;
+      issuerParticipantId: number;
+    }[];
+    expect(service?.credentialSchemaId).not.toBe(
+      organization?.credentialSchemaId,
+    );
+    expect(service?.participantId).not.toBe(organization?.participantId);
+    expect(service?.issuerParticipantId).not.toBe(
+      organization?.issuerParticipantId,
+    );
   });
 });

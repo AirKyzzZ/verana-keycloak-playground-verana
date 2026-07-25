@@ -28,7 +28,7 @@ function localEnvironment(): string[] {
     `EXPECTED_VTJSC_ID=${LOCAL_CONTROLLED.vtjscId}`,
     `EXPECTED_ISSUER_DID=${LOCAL_CONTROLLED.issuerDid}`,
     `EXPECTED_VERIFIER_DID=${LOCAL_CONTROLLED.verifierDid}`,
-    `VERANA_RESOLVER_URL=http://localhost:${LOCAL_CONTROLLED.ports[2]}/v1/trust`,
+    `VERANA_RESOLVER_URL=http://localhost:${LOCAL_CONTROLLED.ports[2]}`,
     `EVIDENCE_MODE=${LOCAL_CONTROLLED.evidenceMode}`,
     `LOCAL_RESOLVER_CONTROL_TOKEN=${secret()}`,
   ];

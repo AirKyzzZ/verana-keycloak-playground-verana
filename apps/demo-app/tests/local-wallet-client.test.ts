@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   LocalWalletClient,
   type ResolvedPresentation,
+  type ReviewedOffer,
 } from "../src/local-wallet-client.js";
 
 interface CapturedRequest {
@@ -76,6 +77,22 @@ async function startAgent(
   };
 }
 
+function positiveReview(): ReviewedOffer {
+  return {
+    gateId: "gate-issuance-1",
+    verdict: "TRUSTED_AUTHORIZED",
+    issuerDid: "did:webvh:test:issuer",
+    credentialIssuer: "https://issuer.example/oid4vci/unfold",
+    evidence: {
+      did: "did:webvh:test:issuer",
+      trustStatus: "TRUSTED",
+      authorized: true,
+      vtjscId: "https://issuer.example/schema.json",
+      queries: ["https://resolver.example/v4/verifiable-trust/resolve"],
+    },
+  };
+}
+
 function positiveResolution(): ResolvedPresentation {
   return {
     gateId: "gate-trusted-1",
@@ -91,6 +108,7 @@ function positiveResolution(): ResolvedPresentation {
       clientId: "x509_hash:verifier",
       clientIdPrefix: "x509_hash",
       verifierDid: "did:webvh:test:verifier",
+      unverifiedClaimedDid: "did:webvh:test:verifier",
       requestedVct: "https://issuer.example/vct",
       requestedClaims: [
         "credentialSchema.id",
@@ -196,6 +214,9 @@ describe("LocalWalletClient", () => {
       };
     });
     const holder = await startAgent((request) => {
+      if (request.path === "/oid4vc-demo/wallet/review-offer") {
+        return { body: positiveReview() };
+      }
       if (request.path === "/oid4vc-demo/wallet/accept-offer") {
         return {
           body: {
@@ -243,7 +264,7 @@ describe("LocalWalletClient", () => {
     });
 
     const offer = await client.issueBadge("local-user");
-    await client.acceptOffer(offer.credentialOffer);
+    await client.acceptOffer(await client.reviewOffer(offer.credentialOffer));
     const presentation = await client.createPresentationRequest();
     const resolved = await client.resolveRequest(
       presentation.authorizationRequest,
@@ -263,6 +284,7 @@ describe("LocalWalletClient", () => {
       },
     ]);
     expect(holder.requests.map(({ path }) => path)).toEqual([
+      "/oid4vc-demo/wallet/review-offer",
       "/oid4vc-demo/wallet/accept-offer",
       "/oid4vc-demo/wallet/resolve-request",
       "/oid4vc-demo/wallet/share",

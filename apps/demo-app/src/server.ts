@@ -280,9 +280,10 @@ export function createDemoServer(options: DemoServerOptions): Koa {
 
     try {
       const issued = await walletClient.issueBadge(subjectId);
-      const acceptedBadge = await walletClient.acceptOffer(
+      const reviewedOffer = await walletClient.reviewOffer(
         issued.credentialOffer,
       );
+      const acceptedBadge = await walletClient.acceptOffer(reviewedOffer);
       if (controlled && acceptedBadge.subjectId !== CONTROLLED_SUBJECT) {
         throw new Error("controlled_subject_mismatch");
       }
@@ -741,15 +742,21 @@ function isExactControlledRogueDenial(
   if (!expectedVct || !expectedVtjscId || !rogueDid || !resolverUrl) {
     return false;
   }
-  const q1Query = `${resolverUrl.replace(/\/+$/, "")}/resolve?did=${encodeURIComponent(rogueDid)}`;
+  // The rogue verifier is refused on identity alone. Its DID is only ever an
+  // unauthenticated X.509 SAN claim, so no gate is minted and the resolver is
+  // never consulted for it.
   return (
     resolution.verdict === "UNTRUSTED" &&
-    resolution.evidence.did === rogueDid &&
-    resolution.evidence.trustStatus === "UNTRUSTED" &&
+    resolution.gateId === "" &&
+    resolution.request.verifierDid === null &&
+    resolution.request.unverifiedClaimedDid === rogueDid &&
+    resolution.evidence.did === null &&
+    resolution.evidence.trustStatus === null &&
     resolution.evidence.authorized === null &&
+    // The rogue request still asks for the gated tuple, so the VTJSC is
+    // reported; only its identity fails.
     resolution.evidence.vtjscId === expectedVtjscId &&
-    exactStrings(resolution.evidence.queries, [q1Query]) &&
-    resolution.request.verifierDid === rogueDid &&
+    resolution.evidence.queries.length === 0 &&
     resolution.request.requestedVct === expectedVct &&
     exactStrings(resolution.request.requestedClaims, CONTROLLED_CLAIMS)
   );

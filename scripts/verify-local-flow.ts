@@ -14,7 +14,7 @@ const PRESENTATION_ATTEMPTS = 20;
 const PRESENTATION_RETRY_MS = 500;
 const LIVE_SUBJECT_ID = "call-demo-user";
 const CONTROLLED_SUBJECT_ID = "local-controlled-user";
-const DEFAULT_RESOLVER_URL = "https://resolver.testnet.verana.network/v1/trust";
+const DEFAULT_RESOLVER_URL = "https://resolver.testnet.verana.network";
 const DEFAULT_ISSUER_DID =
   "did:webvh:QmPjKbgpLykjtHGTUfVRNoHra94mjitQsFniXYCTgmNYzG:unfold-org.77.42.86.24.sslip.io";
 const DEFAULT_VERIFIER_DID =
@@ -43,16 +43,10 @@ interface StrictSchema<T> {
   parse(value: unknown): T;
 }
 
-interface TrustResponse {
+interface V4Resolution {
   did: string;
-  trustStatus: TrustStatus;
-  production: boolean;
-}
-
-interface AuthorizationResponse {
-  authorized: boolean;
-  did: string;
-  vtjscId: string;
+  trusted: boolean;
+  activeRoles: string[];
 }
 
 interface Resolution {
@@ -67,6 +61,7 @@ interface Resolution {
   request: {
     requestedClaims: string[];
     requestedVct: string | null;
+    unverifiedClaimedDid: string | null;
     verifierDid: string | null;
   };
   verdict: Verdict;
@@ -77,8 +72,16 @@ interface PresentationStatus {
   receipt?: unknown;
 }
 
-const trustResponseSchema = schema(parseTrustResponse);
-const authorizationResponseSchema = schema(parseAuthorizationResponse);
+const v4TrustSchema = schema(parseV4Trust);
+function v4ParticipationSchemaFor(config: LocalFlowConfig) {
+  return schema((value: unknown) =>
+    parseV4Participation(
+      value,
+      config.expectedEcosystemId,
+      config.expectedCredentialSchemaId,
+    ),
+  );
+}
 const capabilitySchema = schema(parseCapability);
 const discoverySchema = schema(parseDiscovery);
 const offerSchema = schema(parseOffer);
@@ -111,6 +114,8 @@ export interface LocalFlowConfig {
   expectedVerifierDid: string;
   expectedVct: string;
   expectedVtjscId: string;
+  expectedEcosystemId: number;
+  expectedCredentialSchemaId: number;
   holderBaseUrl: string;
   issuerBaseUrl: string;
   keycloakIssuer: string;
@@ -285,7 +290,7 @@ function verifyControlledConfig(config: LocalFlowConfig): void {
       [config.holderBaseUrl, "http://localhost:3111"],
       [config.issuerBaseUrl, "http://localhost:3101"],
       [config.keycloakIssuer, "http://localhost:8080/realms/verana-playground"],
-      [config.resolverUrl, "http://localhost:3099/v1/trust"],
+      [config.resolverUrl, LOCAL_CONTROLLED.resolverUrl],
       [config.verifierBaseUrl, "http://localhost:3201"],
     ] as const;
     if (exactValues.some(([actual, expected]) => actual !== expected)) {
@@ -349,6 +354,14 @@ export function loadLocalFlowConfig(
     pairwiseSubSecret: new TextEncoder().encode(
       requireSecret(localSecrets, "PAIRWISE_SUB_SECRET"),
     ),
+    expectedEcosystemId: registryId(
+      environment.VERANA_ECOSYSTEM_ID,
+      LOCAL_CONTROLLED.ecosystemId,
+    ),
+    expectedCredentialSchemaId: registryId(
+      environment.VERANA_CREDENTIAL_SCHEMA_ID,
+      LOCAL_CONTROLLED.credentialSchemaId,
+    ),
     resolverUrl: environment.VERANA_RESOLVER_URL ?? DEFAULT_RESOLVER_URL,
     sectorIdentifier: environment.SECTOR_IDENTIFIER ?? "verana-playground",
     verifierBaseUrl:
@@ -362,53 +375,39 @@ async function verifyTrustPreflight(
 ): Promise<void> {
   try {
     const issuerQ1 = await requestJson(
-      resolverUrl(config.resolverUrl, "resolve", {
-        did: config.expectedIssuerDid,
-      }),
-      {},
+      v4ResolveUrl(config.resolverUrl),
+      jsonRequest(q1Body(config.expectedIssuerDid)),
       fetchImpl,
-      trustResponseSchema,
+      v4TrustSchema,
     );
     requireExactTrust(issuerQ1, config.expectedIssuerDid);
 
     const issuerQ2 = await requestJson(
-      resolverUrl(config.resolverUrl, "issuer-authorization", {
-        did: config.expectedIssuerDid,
-        vtjscId: config.expectedVtjscId,
-      }),
-      {},
+      v4ResolveUrl(config.resolverUrl),
+      jsonRequest(participationBody(config.expectedIssuerDid)),
       fetchImpl,
-      authorizationResponseSchema,
+      v4ParticipationSchemaFor(config),
     );
-    requireExactAuthorization(
-      issuerQ2,
-      config.expectedIssuerDid,
-      config.expectedVtjscId,
-    );
+    requireExactAuthorization(issuerQ2, config.expectedIssuerDid, "ISSUER");
 
     const verifierQ1 = await requestJson(
-      resolverUrl(config.resolverUrl, "resolve", {
-        did: config.expectedVerifierDid,
-      }),
-      {},
+      v4ResolveUrl(config.resolverUrl),
+      jsonRequest(q1Body(config.expectedVerifierDid)),
       fetchImpl,
-      trustResponseSchema,
+      v4TrustSchema,
     );
     requireExactTrust(verifierQ1, config.expectedVerifierDid);
 
     const verifierQ3 = await requestJson(
-      resolverUrl(config.resolverUrl, "verifier-authorization", {
-        did: config.expectedVerifierDid,
-        vtjscId: config.expectedVtjscId,
-      }),
-      {},
+      v4ResolveUrl(config.resolverUrl),
+      jsonRequest(participationBody(config.expectedVerifierDid)),
       fetchImpl,
-      authorizationResponseSchema,
+      v4ParticipationSchemaFor(config),
     );
     requireExactAuthorization(
       verifierQ3,
       config.expectedVerifierDid,
-      config.expectedVtjscId,
+      "VERIFIER",
     );
   } catch {
     throw new FlowFailure("BLOCKED_TRUST_PREFLIGHT");
@@ -653,19 +652,25 @@ async function assertRoguePresentationDenied(
   }
 }
 
+// The rogue verifier is refused on identity alone: its DID is only ever an
+// unauthenticated X.509 SAN claim, so the resolver is never consulted and no
+// gate is minted.
 function isExactControlledRogueDenial(
   config: LocalFlowConfig,
   resolution: Resolution,
 ): boolean {
-  const q1Query = `${normalizeBaseUrl(LOCAL_CONTROLLED.resolverUrl)}/resolve?did=${encodeURIComponent(LOCAL_CONTROLLED.rogueDid)}`;
   return (
     resolution.verdict === "UNTRUSTED" &&
-    resolution.evidence.did === LOCAL_CONTROLLED.rogueDid &&
-    resolution.evidence.trustStatus === "UNTRUSTED" &&
+    resolution.gateId === "" &&
+    resolution.request.verifierDid === null &&
+    resolution.request.unverifiedClaimedDid === LOCAL_CONTROLLED.rogueDid &&
+    resolution.evidence.did === null &&
+    resolution.evidence.trustStatus === null &&
     resolution.evidence.authorized === null &&
+    // The rogue request still asks for the gated tuple, so the VTJSC is
+    // reported; only its identity fails.
     resolution.evidence.vtjscId === config.expectedVtjscId &&
-    exactStrings(resolution.evidence.queries, [q1Query]) &&
-    resolution.request.verifierDid === LOCAL_CONTROLLED.rogueDid &&
+    resolution.evidence.queries.length === 0 &&
     resolution.request.requestedVct === config.expectedVct &&
     exactStrings(resolution.request.requestedClaims, [
       "subject_id",
@@ -824,52 +829,6 @@ function schema<T>(parser: (value: unknown) => T): StrictSchema<T> {
   return { parse: parser };
 }
 
-function parseTrustResponse(value: unknown): TrustResponse {
-  const response = strictRecord(value, [
-    "did",
-    "evaluatedAt",
-    "evaluatedAtBlock",
-    "expiresAt",
-    "production",
-    "trustStatus",
-  ]);
-  validateOptionalTimestamp(response.evaluatedAt);
-  validateOptionalTimestamp(response.expiresAt);
-  validateOptionalBlockMetadata(response.evaluatedAtBlock);
-  return {
-    did: boundedString(response.did, MAX_URL_LENGTH),
-    trustStatus: trustStatus(response.trustStatus),
-    production: boolean(response.production),
-  };
-}
-
-function parseAuthorizationResponse(value: unknown): AuthorizationResponse {
-  const response = strictRecord(value, [
-    "authorized",
-    "did",
-    "evaluatedAt",
-    "evaluatedAtBlock",
-    "fees",
-    "permission",
-    "permissionChain",
-    "vtjscId",
-  ]);
-  validateOptionalTimestamp(response.evaluatedAt);
-  validateOptionalBlockMetadata(response.evaluatedAtBlock);
-  for (const metadata of [
-    response.fees,
-    response.permission,
-    response.permissionChain,
-  ]) {
-    if (metadata !== undefined) requireEmptyRecord(metadata);
-  }
-  return {
-    authorized: boolean(response.authorized),
-    did: boundedString(response.did, MAX_URL_LENGTH),
-    vtjscId: boundedUrl(response.vtjscId),
-  };
-}
-
 function parseCapability(value: unknown): {
   contractVersion: 1;
   offerClaims: ["subjectId", "organization", "role"];
@@ -960,12 +919,17 @@ function parseResolution(value: unknown): Resolution {
     "clientIdPrefix",
     "requestedClaims",
     "requestedVct",
+    "unverifiedClaimedDid",
     "verifierDid",
   ]);
   boundedString(request.clientId, MAX_URL_LENGTH);
   boundedString(request.clientIdPrefix, MAX_IDENTIFIER_LENGTH);
   const verifierDid = nullableBoundedString(
     request.verifierDid,
+    MAX_URL_LENGTH,
+  );
+  const unverifiedClaimedDid = nullableBoundedString(
+    request.unverifiedClaimedDid,
     MAX_URL_LENGTH,
   );
   const requestedVct = nullableBoundedString(
@@ -979,8 +943,13 @@ function parseResolution(value: unknown): Resolution {
   );
   return {
     evidence,
-    gateId: boundedString(response.gateId, MAX_IDENTIFIER_LENGTH),
-    request: { requestedClaims, requestedVct, verifierDid },
+    gateId: optionalBoundedString(response.gateId, MAX_IDENTIFIER_LENGTH),
+    request: {
+      requestedClaims,
+      requestedVct,
+      unverifiedClaimedDid,
+      verifierDid,
+    },
     verdict: verdict(response.verdict),
   };
 }
@@ -1085,6 +1054,13 @@ function boundedUrl(value: unknown): string {
   return parsed;
 }
 
+function optionalBoundedString(value: unknown, maximum: number): string {
+  if (typeof value !== "string" || value.length > maximum) {
+    throw new Error("schema_invalid");
+  }
+  return value;
+}
+
 function nullableBoundedString(value: unknown, maximum: number): string | null {
   return value === null ? null : boundedString(value, maximum);
 }
@@ -1161,62 +1137,100 @@ function exactStrings(
   );
 }
 
-function validateOptionalTimestamp(value: unknown): void {
-  if (value === undefined) return;
-  const timestamp = boundedString(value, 64);
-  if (!Number.isFinite(Date.parse(timestamp))) {
-    throw new Error("schema_invalid");
-  }
-}
-
-function validateOptionalBlockMetadata(value: unknown): void {
-  if (value === undefined) return;
-  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
-    return;
-  }
-  requireEmptyRecord(value);
-}
-
-function requireEmptyRecord(value: unknown): void {
-  if (Object.keys(record(value)).length !== 0) {
-    throw new Error("schema_invalid");
-  }
-}
-
-function requireExactTrust(response: TrustResponse, expectedDid: string): void {
-  if (
-    response.did !== expectedDid ||
-    response.trustStatus !== "TRUSTED" ||
-    response.production !== true
-  ) {
+function requireExactTrust(response: V4Resolution, expectedDid: string): void {
+  if (response.did !== expectedDid || response.trusted !== true) {
     throw new Error("trust_mismatch");
   }
 }
 
 function requireExactAuthorization(
-  response: AuthorizationResponse,
+  response: V4Resolution,
   expectedDid: string,
-  expectedVtjscId: string,
+  expectedRole: "ISSUER" | "VERIFIER",
 ): void {
   if (
     response.did !== expectedDid ||
-    response.vtjscId !== expectedVtjscId ||
-    response.authorized !== true
+    response.trusted !== true ||
+    !response.activeRoles.includes(expectedRole)
   ) {
     throw new Error("authorization_mismatch");
   }
 }
 
-function resolverUrl(
-  baseUrl: string,
-  route: string,
-  parameters: Record<string, string>,
-): string {
-  const url = new URL(`${normalizeBaseUrl(baseUrl)}/${route}`);
-  for (const [key, value] of Object.entries(parameters)) {
-    url.searchParams.set(key, value);
+const V4_CORE_KEYS = [
+  "corporationId",
+  "did",
+  "ecosystems",
+  "ecsCredentials",
+  "evaluatedAtBlock",
+  "evaluatedAtTime",
+  "expiresAtTime",
+  "presentations",
+  "services",
+  "trusted",
+] as const;
+
+const Q1_SELECTORS = {
+  ecsCredentials: true,
+  services: true,
+  presentations: {
+    unresolvableCredentialIds: true,
+    invalidCredentialIds: true,
+  },
+  ecosystems: { credentialSchemas: { includeArchived: false } },
+} as const;
+
+function v4ResolveUrl(baseUrl: string): string {
+  return `${normalizeBaseUrl(baseUrl)}/v4/verifiable-trust/resolve`;
+}
+
+function q1Body(did: string): Record<string, unknown> {
+  return { did, ...Q1_SELECTORS };
+}
+
+function participationBody(did: string): Record<string, unknown> {
+  return { did, participations: { states: ["ACTIVE"] }, ...Q1_SELECTORS };
+}
+
+function parseV4Trust(value: unknown): V4Resolution {
+  const response = strictRecord(value, [...V4_CORE_KEYS]);
+  return {
+    did: boundedString(response.did, MAX_URL_LENGTH),
+    trusted: boolean(response.trusted),
+    activeRoles: [],
+  };
+}
+
+function registryId(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!/^\d+$/.test(value)) throw new Error("registry_id_invalid");
+  return Number(value);
+}
+
+function parseV4Participation(
+  value: unknown,
+  ecosystemId: number,
+  credentialSchemaId: number,
+): V4Resolution {
+  const response = strictRecord(value, [...V4_CORE_KEYS, "participations"]);
+  if (!Array.isArray(response.participations)) {
+    throw new Error("schema_invalid");
   }
-  return url.toString();
+  const activeRoles = response.participations.flatMap((entry) => {
+    const participation = entry as Record<string, unknown>;
+    const matches =
+      participation.state === "ACTIVE" &&
+      participation.ecosystemId === ecosystemId &&
+      participation.credentialSchemaId === credentialSchemaId;
+    return matches && typeof participation.role === "string"
+      ? [participation.role]
+      : [];
+  });
+  return {
+    did: boundedString(response.did, MAX_URL_LENGTH),
+    trusted: boolean(response.trusted),
+    activeRoles,
+  };
 }
 
 function jsonRequest(body: unknown): RequestInit {

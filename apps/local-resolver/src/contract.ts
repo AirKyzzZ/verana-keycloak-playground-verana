@@ -1,6 +1,11 @@
 export const ECOSYSTEM_ID = 184;
 export const CREDENTIAL_SCHEMA_ID = 249;
 
+// A CredentialSchema is one digestSri-identified document, so each ECS type has
+// its own id and its own Participant entry, per the spec's worked example.
+export const SERVICE_CREDENTIAL_SCHEMA_ID = 250;
+export const ORGANIZATION_CREDENTIAL_SCHEMA_ID = 251;
+
 export const LINKED_VP_SERVICE_FRAGMENT = "#vpr-schemas-249-vtjsc-vp";
 
 const GATEWAY_ORIGIN = "https://resolver.localhost:3443";
@@ -19,6 +24,10 @@ const PARTICIPANT_IDS = Object.freeze({
   ecosystem: 1,
   issuer: 2,
   verifier: 3,
+  serviceCredential: 601,
+  organizationCredential: 602,
+  serviceCredentialIssuer: 801,
+  organizationCredentialIssuer: 802,
 });
 
 const CORPORATION_ID = 1;
@@ -43,6 +52,11 @@ export type ParticipantRole =
 export interface ResolveSelection {
   did: string;
   withParticipations: boolean;
+  withEcsCredentials: boolean;
+  withServices: boolean;
+  withPresentations: boolean;
+  withPresentationCredentialIds: boolean;
+  withEcosystems: boolean;
 }
 
 // The strict v4 parser rejects any timestamp carrying a sub-second component.
@@ -79,10 +93,10 @@ function ecsCredentials(did: string): unknown[] {
       id: `${GATEWAY_ORIGIN}/credentials/ecs-service-${participantId}`,
       ecsSchema: "ServiceCredential",
       ecsSchemaVersion: "1.0",
-      credentialSchemaId: CREDENTIAL_SCHEMA_ID,
-      issuerParticipantId: PARTICIPANT_IDS.ecosystem,
+      credentialSchemaId: SERVICE_CREDENTIAL_SCHEMA_ID,
+      issuerParticipantId: PARTICIPANT_IDS.serviceCredentialIssuer,
       ecosystemId: ECOSYSTEM_ID,
-      participantId,
+      participantId: PARTICIPANT_IDS.serviceCredential,
       validFrom: VALID_FROM,
       validUntil: VALID_UNTIL,
       credentialSubject: {
@@ -97,10 +111,10 @@ function ecsCredentials(did: string): unknown[] {
       id: `${GATEWAY_ORIGIN}/credentials/ecs-org-${participantId}`,
       ecsSchema: "OrganizationCredential",
       ecsSchemaVersion: "1.0",
-      credentialSchemaId: CREDENTIAL_SCHEMA_ID,
-      issuerParticipantId: PARTICIPANT_IDS.ecosystem,
+      credentialSchemaId: ORGANIZATION_CREDENTIAL_SCHEMA_ID,
+      issuerParticipantId: PARTICIPANT_IDS.organizationCredentialIssuer,
       ecosystemId: ECOSYSTEM_ID,
-      participantId,
+      participantId: PARTICIPANT_IDS.organizationCredential,
       validFrom: VALID_FROM,
       validUntil: VALID_UNTIL,
       credentialSubject: {
@@ -116,7 +130,7 @@ function ecsCredentials(did: string): unknown[] {
 // Exactly one presentation per required Linked-VP fragment, fully resolvable
 // and carrying a VTC reference for this ecosystem and schema. Any deviation
 // makes the agent downgrade the party to UNTRUSTED.
-function presentations(did: string): unknown[] {
+function presentations(did: string, withCredentialIds: boolean): unknown[] {
   const participantId = participantIdFor(did);
   return [
     {
@@ -131,19 +145,22 @@ function presentations(did: string): unknown[] {
           issuerParticipantId: PARTICIPANT_IDS.ecosystem,
         },
       ],
-      unresolvableCredentialIds: [],
-      invalidCredentialIds: [],
+      ...(withCredentialIds
+        ? { unresolvableCredentialIds: [], invalidCredentialIds: [] }
+        : {}),
     },
   ];
 }
 
+// Per the request schema, services[] carries only NON-LinkedVerifiablePresentation
+// entries. The Linked VP is surfaced through presentations[] instead.
 function services(did: string): unknown[] {
-  const participantId = participantIdFor(did);
   return [
     {
-      id: `${did}${LINKED_VP_SERVICE_FRAGMENT}`,
-      type: "LinkedVerifiablePresentation",
-      serviceEndpoint: `${GATEWAY_ORIGIN}/presentations/${participantId}-vtjsc-vp.jwt`,
+      id: `${did}#didcomm`,
+      type: "DIDCommMessaging",
+      serviceEndpoint: `${GATEWAY_ORIGIN}/didcomm`,
+      accept: ["didcomm/v2"],
     },
   ];
 }
@@ -206,14 +223,24 @@ export function resolveResponse(
     trusted,
     evaluatedAtTime: utc(nowMilliseconds),
     evaluatedAtBlock: EVALUATED_AT_BLOCK,
-    expiresAtTime: null,
+    expiresAtTime: trusted ? VALID_UNTIL : null,
     corporationId: CORPORATION_ID,
-    ecsCredentials: trusted ? ecsCredentials(selection.did) : [],
-    presentations: trusted ? presentations(selection.did) : [],
-    services: trusted ? services(selection.did) : [],
-    ecosystems: trusted ? ecosystems() : [],
   };
 
+  if (selection.withEcsCredentials) {
+    response.ecsCredentials = trusted ? ecsCredentials(selection.did) : [];
+  }
+  if (selection.withPresentations) {
+    response.presentations = trusted
+      ? presentations(selection.did, selection.withPresentationCredentialIds)
+      : [];
+  }
+  if (selection.withServices) {
+    response.services = trusted ? services(selection.did) : [];
+  }
+  if (selection.withEcosystems) {
+    response.ecosystems = trusted ? ecosystems() : [];
+  }
   if (selection.withParticipations) {
     response.participations = trusted ? participations(selection.did) : [];
   }
