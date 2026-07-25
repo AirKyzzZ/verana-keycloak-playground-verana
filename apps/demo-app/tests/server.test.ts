@@ -30,6 +30,12 @@ const config: DemoServerOptions["config"] = {
   EVIDENCE_MODE: "LIVE_VERANA",
 };
 const APP_ORIGIN = new URL(config.DEMO_APP_REDIRECT_URI).origin;
+const CONTROLLED_ROGUE_DID = "did:web:rogue.localhost";
+const CONTROLLED_VCT =
+  "http://host.docker.internal:3099/vct/local-controlled-employee";
+const CONTROLLED_VTJSC =
+  "http://host.docker.internal:3099/vtjsc/local-controlled-employee.json";
+const CONTROLLED_RESOLVER = "http://host.docker.internal:3099/v1/trust";
 const servers: Server[] = [];
 
 const transaction: AuthorizationTransaction = {
@@ -77,6 +83,25 @@ const positiveResolution: ResolvedPresentation = {
   },
 };
 
+const exactRogueDenial: ResolvedPresentation = {
+  gateId: "gate-rogue-sensitive",
+  verdict: "UNTRUSTED",
+  evidence: {
+    did: CONTROLLED_ROGUE_DID,
+    trustStatus: "UNTRUSTED",
+    authorized: null,
+    vtjscId: CONTROLLED_VTJSC,
+    queries: [`${CONTROLLED_RESOLVER}/resolve?did=did%3Aweb%3Arogue.localhost`],
+  },
+  request: {
+    clientId: "x509_hash:rogue-verifier",
+    clientIdPrefix: "x509_hash",
+    verifierDid: CONTROLLED_ROGUE_DID,
+    requestedVct: CONTROLLED_VCT,
+    requestedClaims: ["subject_id", "organization", "role"],
+  },
+};
+
 function createOptions(
   identity: KeycloakIdentity = authorizedIdentity,
   evidenceMode: DemoServerOptions["config"]["EVIDENCE_MODE"] = config.EVIDENCE_MODE,
@@ -90,6 +115,7 @@ function createOptions(
     issueBadge: ReturnType<typeof vi.fn>;
     resolveRequest: ReturnType<typeof vi.fn>;
     share: ReturnType<typeof vi.fn>;
+    testRogueDenial: ReturnType<typeof vi.fn>;
   };
 } {
   const startAuthorization = vi.fn(async () => ({
@@ -98,14 +124,29 @@ function createOptions(
   }));
   const exchangeCallback = vi.fn(async () => identity);
   const issueBadge = vi.fn(async () => issuedBadge);
-  const acceptOffer = vi.fn(async () => acceptedBadge);
+  const acceptOffer = vi.fn(async () =>
+    evidenceMode === "LOCAL_CONTROLLED"
+      ? { ...acceptedBadge, subjectId: "local-controlled-user" }
+      : acceptedBadge,
+  );
   const resolveRequest = vi.fn(async () => positiveResolution);
   const share = vi.fn(
     async (): Promise<SharedPresentation> => ({ shared: true, status: 200 }),
   );
+  const testRogueDenial = vi.fn(async () => exactRogueDenial);
 
   return {
-    config: { ...config, EVIDENCE_MODE: evidenceMode },
+    config: Object.assign(
+      { ...config, EVIDENCE_MODE: evidenceMode },
+      evidenceMode === "LOCAL_CONTROLLED"
+        ? {
+            EXPECTED_VCT: CONTROLLED_VCT,
+            EXPECTED_VTJSC_ID: CONTROLLED_VTJSC,
+            ROGUE_VERIFIER_DID: CONTROLLED_ROGUE_DID,
+            VERANA_RESOLVER_URL: CONTROLLED_RESOLVER,
+          }
+        : {},
+    ),
     keycloakClient: {
       exchangeCallback,
       startAuthorization,
@@ -117,6 +158,7 @@ function createOptions(
       issueBadge,
       resolveRequest,
       share,
+      testRogueDenial,
     },
   };
 }
@@ -176,7 +218,11 @@ async function openWallet(
 
 function walletMutation(
   agent: ReturnType<typeof request.agent>,
-  path: "/wallet/issue" | "/wallet/resolve" | "/wallet/share",
+  path:
+    | "/wallet/issue"
+    | "/wallet/resolve"
+    | "/wallet/share"
+    | "/wallet/test-rogue-denial",
   token: string,
   body: Record<string, string> = {},
 ) {
@@ -464,6 +510,321 @@ describe("OIDC application routes", () => {
 });
 
 describe("local-holder routes", () => {
+  it("renders a fixed readonly controlled holder subject and keeps the LIVE_VERANA input unchanged", async () => {
+    const controlled = await request(
+      await startDemoServer(
+        createOptions(authorizedIdentity, "LOCAL_CONTROLLED"),
+      ),
+    )
+      .get("/wallet")
+      .expect(200);
+    const live = await request(await startDemoServer())
+      .get("/wallet")
+      .expect(200);
+
+    expect(controlled.text).toContain("local-controlled-user");
+    expect(controlled.text).toContain("readonly");
+    expect(controlled.text).not.toContain('name="subjectId"');
+    expect(controlled.text).toContain("Test rogue verifier denial");
+    expect(live.text).toContain('name="subjectId"');
+    expect(live.text).toContain('value="local-demo-user"');
+    expect(live.text).not.toContain("Test rogue verifier denial");
+  });
+
+  it("uses the exact fixed controlled subject and rejects every browser override", async () => {
+    const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+    const agent = request.agent(await startDemoServer(options));
+    const token = await openWallet(agent);
+
+    await walletMutation(agent, "/wallet/issue", token).expect(200);
+    expect(options.walletClient.issueBadge).toHaveBeenCalledWith(
+      "local-controlled-user",
+    );
+
+    const override = await walletMutation(agent, "/wallet/issue", token, {
+      subjectId: "attacker-selected-subject",
+    }).expect(400);
+
+    expect(override.text).toContain("Invalid badge request");
+    expect(options.walletClient.issueBadge).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when the controlled holder returns a different subject", async () => {
+    const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+    options.walletClient.acceptOffer.mockResolvedValueOnce({
+      ...acceptedBadge,
+      subjectId: "upstream-subject-drift",
+    });
+    const agent = request.agent(await startDemoServer(options));
+    const token = await openWallet(agent);
+
+    const response = await walletMutation(agent, "/wallet/issue", token).expect(
+      502,
+    );
+
+    expect(response.text).toContain("Local VS Agent unavailable");
+    expect(response.text).not.toContain("upstream-subject-drift");
+  });
+
+  it("does not expose the rogue denial route in LIVE_VERANA", async () => {
+    const options = createOptions();
+    const agent = request.agent(await startDemoServer(options));
+    const token = await openWallet(agent);
+
+    await walletMutation(agent, "/wallet/test-rogue-denial", token).expect(404);
+
+    expect(options.walletClient.testRogueDenial).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "null", "http://localhost:4000"])(
+    "rejects controlled rogue denial with Origin %j before any upstream call",
+    async (origin) => {
+      const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+      const agent = request.agent(await startDemoServer(options));
+      const token = await openWallet(agent);
+      const mutation = agent
+        .post("/wallet/test-rogue-denial")
+        .type("form")
+        .send({ csrfToken: token });
+      if (origin) mutation.set("Origin", origin);
+
+      await mutation.expect(403);
+
+      expect(options.walletClient.testRogueDenial).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, "wrong-csrf-token"])(
+    "rejects controlled rogue denial with CSRF token %j before any upstream call",
+    async (submittedToken) => {
+      const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+      const agent = request.agent(await startDemoServer(options));
+      const token = await openWallet(agent);
+
+      await agent
+        .post("/wallet/test-rogue-denial")
+        .set("Origin", APP_ORIGIN)
+        .type("form")
+        .send({ csrfToken: submittedToken ?? "" })
+        .expect(403);
+
+      expect(token).not.toBe(submittedToken);
+      expect(options.walletClient.testRogueDenial).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["tenant", "attacker-selected-tenant"],
+    ["authorizationRequest", "openid4vp://attacker-request"],
+    ["verifierDid", "did:web:attacker.example"],
+    ["requestedVct", "https://attacker.example/vct"],
+    ["vtjscId", "https://attacker.example/vtjsc"],
+    ["requestedClaims", "admin"],
+  ])(
+    "rejects browser-supplied rogue protocol field %s",
+    async (field, value) => {
+      const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+      const agent = request.agent(await startDemoServer(options));
+      const token = await openWallet(agent);
+
+      const response = await walletMutation(
+        agent,
+        "/wallet/test-rogue-denial",
+        token,
+        { [field]: value },
+      ).expect(400);
+
+      expect(response.text).not.toContain(value);
+      expect(options.walletClient.testRogueDenial).not.toHaveBeenCalled();
+    },
+  );
+
+  it("renders only the terminal controlled denial summary and never crosses share or Keycloak", async () => {
+    const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+    const agent = request.agent(await startDemoServer(options));
+    const token = await openWallet(agent);
+
+    const response = await walletMutation(
+      agent,
+      "/wallet/test-rogue-denial",
+      token,
+    ).expect(200);
+
+    expect(response.text).toContain("LOCAL_CONTROLLED");
+    expect(response.text).toContain(CONTROLLED_ROGUE_DID);
+    expect(response.text).toContain("UNTRUSTED");
+    expect(response.text).toContain("Sharing refused");
+    expect(response.text).not.toContain("gate-rogue-sensitive");
+    expect(response.text).not.toContain(CONTROLLED_VCT);
+    expect(response.text).not.toContain(CONTROLLED_VTJSC);
+    expect(response.text).not.toContain("subject_id");
+    expect(response.text).not.toContain("authorizationRequest");
+    expect(response.text).not.toContain("Share approved claims");
+    expect(response.text).not.toContain('action="/wallet/share"');
+    expect(options.walletClient.testRogueDenial).toHaveBeenCalledOnce();
+    expect(options.walletClient.share).not.toHaveBeenCalled();
+    expect(options.keycloakClient.startAuthorization).not.toHaveBeenCalled();
+    expect(options.keycloakClient.exchangeCallback).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "verdict",
+      { ...exactRogueDenial, verdict: "TRUSTED_AUTHORIZED" as const },
+    ],
+    [
+      "request DID",
+      {
+        ...exactRogueDenial,
+        request: {
+          ...exactRogueDenial.request,
+          verifierDid: "did:web:wrong.localhost",
+        },
+      },
+    ],
+    [
+      "evidence DID",
+      {
+        ...exactRogueDenial,
+        evidence: {
+          ...exactRogueDenial.evidence,
+          did: "did:web:wrong.localhost",
+        },
+      },
+    ],
+    [
+      "trust",
+      {
+        ...exactRogueDenial,
+        evidence: {
+          ...exactRogueDenial.evidence,
+          trustStatus: "TRUSTED" as const,
+        },
+      },
+    ],
+    [
+      "authorization",
+      {
+        ...exactRogueDenial,
+        evidence: { ...exactRogueDenial.evidence, authorized: true },
+      },
+    ],
+    [
+      "VTJSC",
+      {
+        ...exactRogueDenial,
+        evidence: {
+          ...exactRogueDenial.evidence,
+          vtjscId: "https://wrong.example/vtjsc",
+        },
+      },
+    ],
+    [
+      "VCT",
+      {
+        ...exactRogueDenial,
+        request: {
+          ...exactRogueDenial.request,
+          requestedVct: "https://wrong.example/vct",
+        },
+      },
+    ],
+    [
+      "claims",
+      {
+        ...exactRogueDenial,
+        request: {
+          ...exactRogueDenial.request,
+          requestedClaims: ["subject_id", "organization"],
+        },
+      },
+    ],
+    [
+      "resolver evidence",
+      {
+        ...exactRogueDenial,
+        evidence: { ...exactRogueDenial.evidence, queries: [] },
+      },
+    ],
+  ])("fails closed on rogue denial drift in %s", async (_name, resolution) => {
+    const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+    options.walletClient.testRogueDenial.mockResolvedValueOnce(resolution);
+    const agent = request.agent(await startDemoServer(options));
+    const token = await openWallet(agent);
+
+    const response = await walletMutation(
+      agent,
+      "/wallet/test-rogue-denial",
+      token,
+    ).expect(502);
+
+    expect(response.text).toContain(
+      "Rogue verifier denial could not be verified",
+    );
+    expect(response.text).not.toContain("gate-rogue-sensitive");
+    expect(response.text).not.toContain("Share approved claims");
+    expect(response.text).not.toContain('action="/wallet/share"');
+    expect(options.walletClient.share).not.toHaveBeenCalled();
+    expect(options.keycloakClient.startAuthorization).not.toHaveBeenCalled();
+    expect(options.keycloakClient.exchangeCallback).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a rogue client error without exposing the error or a share control", async () => {
+    const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+    options.walletClient.testRogueDenial.mockRejectedValueOnce(
+      new Error("raw rogue authorization request and secret"),
+    );
+    const agent = request.agent(await startDemoServer(options));
+    const token = await openWallet(agent);
+
+    const response = await walletMutation(
+      agent,
+      "/wallet/test-rogue-denial",
+      token,
+    ).expect(502);
+
+    expect(response.text).toContain(
+      "Rogue verifier denial could not be verified",
+    );
+    expect(response.text).not.toContain("raw rogue authorization request");
+    expect(response.text).not.toContain("secret");
+    expect(response.text).not.toContain("Share approved claims");
+    expect(response.text).not.toContain('action="/wallet/share"');
+    expect(options.walletClient.share).not.toHaveBeenCalled();
+  });
+
+  it("invalidates a prior trusted gate before awaiting the controlled rogue denial", async () => {
+    let releaseRogue: (() => void) | undefined;
+    const roguePending = new Promise<ResolvedPresentation>((resolve) => {
+      releaseRogue = () => resolve(exactRogueDenial);
+    });
+    const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+    options.walletClient.testRogueDenial.mockImplementationOnce(
+      async () => await roguePending,
+    );
+    const agent = request.agent(await startDemoServer(options));
+    const token = await openWallet(agent);
+    await walletMutation(agent, "/wallet/resolve", token, {
+      authorizationRequest: "openid4vp://trusted-request",
+    }).expect(200);
+
+    const pendingRogue = walletMutation(
+      agent,
+      "/wallet/test-rogue-denial",
+      token,
+    ).then((response) => response);
+    await vi.waitFor(() => {
+      expect(options.walletClient.testRogueDenial).toHaveBeenCalledOnce();
+    });
+    const share = await walletMutation(agent, "/wallet/share", token);
+    releaseRogue?.();
+    const denied = await pendingRogue;
+
+    expect(share.status).toBe(409);
+    expect(denied.status).toBe(200);
+    expect(options.walletClient.share).not.toHaveBeenCalled();
+  });
+
   it("renders one cryptographically random server-bound CSRF token into every wallet form", async () => {
     const agent = request.agent(await startDemoServer());
 

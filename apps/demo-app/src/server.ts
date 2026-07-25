@@ -6,6 +6,7 @@ import bodyParser from "koa-bodyparser";
 
 import type { DemoConfig, EvidenceMode } from "./config.js";
 import {
+  renderControlledRogueDenialPage,
   renderErrorPage,
   renderHomePage,
   renderProfilePage,
@@ -29,6 +30,8 @@ const WALLET_TTL_MS = 30 * 60 * 1_000;
 const AUTH_MAX_ENTRIES = 1_024;
 const SESSION_MAX_ENTRIES = 1_024;
 const WALLET_MAX_ENTRIES = 512;
+const CONTROLLED_SUBJECT = "local-controlled-user";
+const CONTROLLED_CLAIMS = ["subject_id", "organization", "role"] as const;
 
 interface WalletWorkflow extends WalletPageState {
   operationId?: string;
@@ -236,15 +239,22 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       config.EVIDENCE_MODE,
     );
     if (!access) return;
-    const subjectId = formString(context, "subjectId", 200);
-    if (!subjectId) {
+    const controlled = config.EVIDENCE_MODE === "LOCAL_CONTROLLED";
+    const subjectId = controlled
+      ? CONTROLLED_SUBJECT
+      : formString(context, "subjectId", 200);
+    const hasControlledOverride =
+      controlled && hasFormField(context, "subjectId");
+    if (!subjectId || hasControlledOverride) {
       html(
         context,
         400,
         renderErrorPage(
           config.EVIDENCE_MODE,
           "Invalid badge request",
-          "An opaque subject of at most 200 characters is required.",
+          controlled
+            ? "The controlled holder subject is fixed by the server."
+            : "An opaque subject of at most 200 characters is required.",
         ),
       );
       return;
@@ -273,6 +283,9 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       const acceptedBadge = await walletClient.acceptOffer(
         issued.credentialOffer,
       );
+      if (controlled && acceptedBadge.subjectId !== CONTROLLED_SUBJECT) {
+        throw new Error("controlled_subject_mismatch");
+      }
       if (
         !isCurrentOperation(walletStore, access.token, "issuing", operationId)
       ) {
@@ -385,6 +398,100 @@ export function createDemoServer(options: DemoServerOptions): Koa {
         },
       );
       renderVsAgentUnavailable(context, config.EVIDENCE_MODE);
+    }
+  });
+
+  router.post("/wallet/test-rogue-denial", async (context) => {
+    if (config.EVIDENCE_MODE !== "LOCAL_CONTROLLED") {
+      context.status = 404;
+      return;
+    }
+    const access = requireWalletMutation(
+      context,
+      walletStore,
+      expectedOrigin,
+      config.EVIDENCE_MODE,
+    );
+    if (!access) return;
+    if (!hasExactFormFields(context, ["csrfToken"])) {
+      html(
+        context,
+        400,
+        renderErrorPage(
+          config.EVIDENCE_MODE,
+          "Invalid rogue verifier request",
+          "This controlled test accepts no browser-selected protocol input.",
+        ),
+      );
+      return;
+    }
+    if (isOperationInProgress(access.workflow.workflowStatus)) {
+      renderWorkflowConflict(
+        context,
+        config.EVIDENCE_MODE,
+        access.workflow.workflowStatus,
+      );
+      return;
+    }
+    const operationId = randomOpaqueValue();
+    const pending: WalletWorkflow = {
+      csrfToken: access.workflow.csrfToken,
+      operationId,
+      workflowStatus: "rogue_testing",
+    };
+    if (!walletStore.replace(access.token, pending)) {
+      renderExpiredWallet(context, config.EVIDENCE_MODE);
+      return;
+    }
+
+    try {
+      const resolution = await walletClient.testRogueDenial();
+      if (
+        !isCurrentOperation(
+          walletStore,
+          access.token,
+          "rogue_testing",
+          operationId,
+        )
+      ) {
+        renderSupersededWallet(context, config.EVIDENCE_MODE);
+        return;
+      }
+      if (!isExactControlledRogueDenial(config, resolution)) {
+        throw new Error("rogue_denial_binding_invalid");
+      }
+      walletStore.replace(access.token, {
+        csrfToken: access.workflow.csrfToken,
+        workflowStatus: "rogue_denied",
+      });
+      html(
+        context,
+        200,
+        renderControlledRogueDenialPage(
+          config.EVIDENCE_MODE,
+          config.ROGUE_VERIFIER_DID,
+        ),
+      );
+    } catch {
+      replaceCurrentOperation(
+        walletStore,
+        access.token,
+        "rogue_testing",
+        operationId,
+        {
+          csrfToken: access.workflow.csrfToken,
+          workflowStatus: "rogue_failed",
+        },
+      );
+      html(
+        context,
+        502,
+        renderErrorPage(
+          config.EVIDENCE_MODE,
+          "Rogue verifier denial could not be verified",
+          "The bounded controlled check failed closed. Sharing remains unavailable.",
+        ),
+      );
     }
   });
 
@@ -541,16 +648,34 @@ function formString(
   field: string,
   maxLength: number,
 ): string | undefined {
+  const value = formBody(context)?.[field];
+  if (typeof value !== "string" || !value.trim() || value.length > maxLength) {
+    return undefined;
+  }
+  return value.trim();
+}
+
+function formBody(context: Context): Record<string, unknown> | undefined {
   const body = (context.request as typeof context.request & { body?: unknown })
     .body;
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return undefined;
   }
-  const value = (body as Record<string, unknown>)[field];
-  if (typeof value !== "string" || !value.trim() || value.length > maxLength) {
-    return undefined;
-  }
-  return value.trim();
+  return body as Record<string, unknown>;
+}
+
+function hasFormField(context: Context, field: string): boolean {
+  return Object.hasOwn(formBody(context) ?? {}, field);
+}
+
+function hasExactFormFields(
+  context: Context,
+  expectedFields: readonly string[],
+): boolean {
+  const body = formBody(context);
+  if (!body) return false;
+  const fields = Object.keys(body).sort();
+  return exactStrings(fields, [...expectedFields].sort());
 }
 
 function html(context: Context, status: number, body: string): void {
@@ -593,7 +718,54 @@ function isCurrentOperation(
 function isOperationInProgress(
   status: WalletWorkflow["workflowStatus"],
 ): boolean {
-  return status === "issuing" || status === "resolving" || status === "sharing";
+  return (
+    status === "issuing" ||
+    status === "resolving" ||
+    status === "sharing" ||
+    status === "rogue_testing"
+  );
+}
+
+function isExactControlledRogueDenial(
+  config: DemoConfig,
+  resolution: Awaited<ReturnType<LocalWalletClientContract["testRogueDenial"]>>,
+): config is DemoConfig & {
+  EXPECTED_VCT: string;
+  EXPECTED_VTJSC_ID: string;
+  ROGUE_VERIFIER_DID: string;
+  VERANA_RESOLVER_URL: string;
+} {
+  const {
+    EXPECTED_VCT: expectedVct,
+    EXPECTED_VTJSC_ID: expectedVtjscId,
+    ROGUE_VERIFIER_DID: rogueDid,
+    VERANA_RESOLVER_URL: resolverUrl,
+  } = config;
+  if (!expectedVct || !expectedVtjscId || !rogueDid || !resolverUrl) {
+    return false;
+  }
+  const q1Query = `${resolverUrl.replace(/\/+$/, "")}/resolve?did=${encodeURIComponent(rogueDid)}`;
+  return (
+    resolution.verdict === "UNTRUSTED" &&
+    resolution.evidence.did === rogueDid &&
+    resolution.evidence.trustStatus === "UNTRUSTED" &&
+    resolution.evidence.authorized === null &&
+    resolution.evidence.vtjscId === expectedVtjscId &&
+    exactStrings(resolution.evidence.queries, [q1Query]) &&
+    resolution.request.verifierDid === rogueDid &&
+    resolution.request.requestedVct === expectedVct &&
+    exactStrings(resolution.request.requestedClaims, CONTROLLED_CLAIMS)
+  );
+}
+
+function exactStrings(
+  actual: readonly string[],
+  expected: readonly string[],
+): boolean {
+  return (
+    actual.length === expected.length &&
+    actual.every((value, index) => value === expected[index])
+  );
 }
 
 function randomOpaqueValue(): string {
@@ -706,7 +878,9 @@ function renderWorkflowConflict(
       ? "Badge issuance"
       : status === "resolving"
         ? "Request resolution"
-        : "Presentation sharing";
+        : status === "rogue_testing"
+          ? "Rogue verifier check"
+          : "Presentation sharing";
   html(
     context,
     409,

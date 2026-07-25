@@ -118,6 +118,72 @@ afterEach(async () => {
 });
 
 describe("LocalWalletClient", () => {
+  it("creates and resolves the fixed rogue request without exposing a caller-selected tenant or request", async () => {
+    const verifier = await startAgent((request) => {
+      if (request.path !== "/oid4vc-demo/verifier/requests") return undefined;
+      return {
+        body: {
+          authorizationRequest: "openid4vp://rogue-sensitive-request",
+          sessionId: "rogue-verification-1",
+        },
+      };
+    });
+    const holder = await startAgent((request) => {
+      if (request.path !== "/oid4vc-demo/wallet/resolve-request") {
+        return undefined;
+      }
+      return {
+        body: {
+          ...positiveResolution(),
+          gateId: "gate-rogue-sensitive",
+          verdict: "UNTRUSTED",
+          evidence: {
+            did: "did:web:rogue.localhost",
+            trustStatus: "UNTRUSTED",
+            authorized: null,
+            vtjscId:
+              "http://host.docker.internal:3099/vtjsc/local-controlled-employee.json",
+            queries: [
+              "http://host.docker.internal:3099/v1/trust/resolve?did=did%3Aweb%3Arogue.localhost",
+            ],
+          },
+          request: {
+            ...positiveResolution().request,
+            verifierDid: "did:web:rogue.localhost",
+            requestedVct:
+              "http://host.docker.internal:3099/vct/local-controlled-employee",
+            requestedClaims: ["subject_id", "organization", "role"],
+          },
+        },
+      };
+    });
+    const client = new LocalWalletClient({
+      issuerBaseUrl: "http://127.0.0.1:1",
+      holderBaseUrl: holder.baseUrl,
+      verifierBaseUrl: verifier.baseUrl,
+    });
+
+    const result = await client.testRogueDenial();
+
+    expect(result.verdict).toBe("UNTRUSTED");
+    expect(verifier.requests).toEqual([
+      {
+        body: { tenant: "rogue" },
+        method: "POST",
+        path: "/oid4vc-demo/verifier/requests",
+      },
+    ]);
+    expect(holder.requests).toEqual([
+      {
+        body: {
+          authorizationRequest: "openid4vp://rogue-sensitive-request",
+        },
+        method: "POST",
+        path: "/oid4vc-demo/wallet/resolve-request",
+      },
+    ]);
+  });
+
   it("uses separate issuer, holder, and verifier origins for each role", async () => {
     const issuer = await startAgent((request) => {
       if (request.path !== "/oid4vc-demo/offers") return undefined;

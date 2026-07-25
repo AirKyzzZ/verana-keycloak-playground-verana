@@ -115,6 +115,7 @@ export interface LocalWalletClientContract {
   issueBadge(subjectId: string): Promise<IssuedBadge>;
   resolveRequest(authorizationRequest: string): Promise<ResolvedPresentation>;
   share(resolved: ResolvedPresentation): Promise<SharedPresentation>;
+  testRogueDenial(): Promise<ResolvedPresentation>;
 }
 
 export class LocalWalletClient implements LocalWalletClientContract {
@@ -183,6 +184,29 @@ export class LocalWalletClient implements LocalWalletClientContract {
         body: JSON.stringify({ tenant: "trusted" }),
       },
       presentationRequestSchema,
+    );
+  }
+
+  async testRogueDenial(): Promise<ResolvedPresentation> {
+    const request = await this.#request(
+      this.#verifierBaseUrl,
+      "/oid4vc-demo/verifier/requests",
+      {
+        method: "POST",
+        body: JSON.stringify({ tenant: "rogue" }),
+      },
+      presentationRequestSchema,
+    );
+    return await this.#request(
+      this.#holderBaseUrl,
+      "/oid4vc-demo/wallet/resolve-request",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          authorizationRequest: request.authorizationRequest,
+        }),
+      },
+      resolvedPresentationSchema,
     );
   }
 

@@ -20,7 +20,10 @@ export interface WalletPageState {
     | "resolved"
     | "sharing"
     | "shared"
-    | "share_uncertain";
+    | "share_uncertain"
+    | "rogue_testing"
+    | "rogue_denied"
+    | "rogue_failed";
 }
 
 export function escapeHtml(value: string): string {
@@ -117,6 +120,25 @@ export function renderWalletPage(
     ? `<p class="success">Presentation shared through the local holder.</p>`
     : "";
   const workflowNotice = renderWorkflowNotice(state.workflowStatus);
+  const issueSubject =
+    evidenceMode === "LOCAL_CONTROLLED"
+      ? `
+        <label for="subject-id">Fixed holder subject</label>
+        <input id="subject-id" readonly value="local-controlled-user">
+      `
+      : `
+        <label for="subject-id">Opaque demo subject</label>
+        <input id="subject-id" name="subjectId" required maxlength="200" value="local-demo-user">
+      `;
+  const rogueDenialControl =
+    evidenceMode === "LOCAL_CONTROLLED"
+      ? `
+        <form method="post" action="/wallet/test-rogue-denial">
+          ${csrfField}
+          <button type="submit">Test rogue verifier denial</button>
+        </form>
+      `
+      : "";
 
   return renderDocument(
     "Local holder",
@@ -137,8 +159,7 @@ export function renderWalletPage(
       </ol>
       <form method="post" action="/wallet/issue">
         ${csrfField}
-        <label for="subject-id">Opaque demo subject</label>
-        <input id="subject-id" name="subjectId" required maxlength="200" value="local-demo-user">
+        ${issueSubject}
         <button type="submit">Issue and accept badge</button>
       </form>
       ${credential}
@@ -148,10 +169,33 @@ export function renderWalletPage(
         <textarea id="authorization-request" name="authorizationRequest" required maxlength="10000"></textarea>
         <button type="submit">Resolve and review request</button>
       </form>
+      ${rogueDenialControl}
       ${workflowNotice}
       ${resolution}
       ${shared}
       <p><a href="/">Return to protected application</a></p>
+    `,
+  );
+}
+
+export function renderControlledRogueDenialPage(
+  evidenceMode: EvidenceMode,
+  rogueVerifierDid: string,
+): string {
+  return renderDocument(
+    "Rogue verifier denied",
+    `
+      ${renderEvidenceBoundary(evidenceMode)}
+      <h1>Rogue verifier denial</h1>
+      <dl>
+        <dt>Rogue verifier DID</dt>
+        <dd>${escapeHtml(rogueVerifierDid)}</dd>
+        <dt>Trust status</dt>
+        <dd>UNTRUSTED</dd>
+        <dt>Disclosure</dt>
+        <dd>Sharing refused</dd>
+      </dl>
+      <p><a href="/wallet">Return to the local holder</a></p>
     `,
   );
 }
@@ -230,6 +274,10 @@ function renderWorkflowNotice(
       return `<p class="warning">Presentation sharing is in progress.</p>`;
     case "share_uncertain":
       return `<p class="error">Sharing outcome is uncertain. Resolve and review a new request before any further attempt.</p>`;
+    case "rogue_testing":
+      return `<p class="warning">Rogue verifier denial is being checked. Any previous sharing approval has been discarded.</p>`;
+    case "rogue_failed":
+      return `<p class="error">Rogue verifier denial could not be verified. Any previous sharing approval has been discarded.</p>`;
     default:
       return "";
   }
