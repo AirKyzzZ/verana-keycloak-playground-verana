@@ -44,8 +44,21 @@ const evidenceSchema = z.strictObject({
 });
 
 // A refused review carries an empty gate id: the agent mints a gate only for an
-// exact TRUSTED_AUTHORIZED verdict.
+// exact TRUSTED_AUTHORIZED verdict. Enforcing both directions here means a
+// response claiming a refusal can never smuggle in a usable gate.
 const gateIdSchema = z.string().trim().max(MAX_IDENTIFIER_LENGTH);
+
+function gateMatchesVerdict(value: {
+  gateId: string;
+  verdict: z.infer<typeof verdictSchema>;
+}): boolean {
+  return value.verdict === "TRUSTED_AUTHORIZED"
+    ? value.gateId.length > 0
+    : value.gateId.length === 0;
+}
+
+const GATE_INVARIANT_MESSAGE =
+  "a gate id is present only for a TRUSTED_AUTHORIZED verdict";
 
 const reviewedOfferSchema = z.strictObject({
   gateId: gateIdSchema,
@@ -53,7 +66,7 @@ const reviewedOfferSchema = z.strictObject({
   issuerDid: z.string().max(MAX_URL_LENGTH).nullable(),
   credentialIssuer: z.string().max(MAX_URL_LENGTH),
   evidence: evidenceSchema,
-});
+}).refine(gateMatchesVerdict, { message: GATE_INVARIANT_MESSAGE });
 
 const resolvedPresentationSchema = z.strictObject({
   gateId: gateIdSchema,
@@ -71,7 +84,7 @@ const resolvedPresentationSchema = z.strictObject({
       .array(z.string().max(MAX_IDENTIFIER_LENGTH))
       .max(MAX_COLLECTION_ITEMS),
   }),
-});
+}).refine(gateMatchesVerdict, { message: GATE_INVARIANT_MESSAGE });
 
 const presentationRequestSchema = z.strictObject({
   authorizationRequest: z.string().trim().min(1).max(MAX_EXCHANGE_VALUE_LENGTH),
@@ -268,7 +281,7 @@ export class LocalWalletClient implements LocalWalletClientContract {
   }
 
   async share(resolved: ResolvedPresentation): Promise<SharedPresentation> {
-    if (resolved.verdict !== "TRUSTED_AUTHORIZED") {
+    if (resolved.verdict !== "TRUSTED_AUTHORIZED" || !resolved.gateId) {
       throw new Error("verifier_not_authorized");
     }
     return await this.#request(

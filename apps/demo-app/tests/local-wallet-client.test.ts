@@ -153,23 +153,22 @@ describe("LocalWalletClient", () => {
       return {
         body: {
           ...positiveResolution(),
-          gateId: "gate-rogue-sensitive",
+          gateId: "",
           verdict: "UNTRUSTED",
           evidence: {
-            did: "did:web:rogue.localhost",
-            trustStatus: "UNTRUSTED",
+            did: null,
+            trustStatus: null,
             authorized: null,
             vtjscId:
-              "http://host.docker.internal:3099/vtjsc/local-controlled-employee.json",
-            queries: [
-              "http://host.docker.internal:3099/v1/trust/resolve?did=did%3Aweb%3Arogue.localhost",
-            ],
+              "https://resolver.localhost:3443/vtjsc/local-controlled-employee.json",
+            queries: [],
           },
           request: {
             ...positiveResolution().request,
-            verifierDid: "did:web:rogue.localhost",
+            verifierDid: null,
+            unverifiedClaimedDid: "did:web:verifier.localhost%3A3443:rogue",
             requestedVct:
-              "http://host.docker.internal:3099/vct/local-controlled-employee",
+              "https://resolver.localhost:3443/vct/local-controlled-employee",
             requestedClaims: ["subject_id", "organization", "role"],
           },
         },

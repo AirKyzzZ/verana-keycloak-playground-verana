@@ -333,6 +333,12 @@ export async function createLocalTlsBundle(options: {
     };
     for (const name of GENERATED_FILES) {
       const path = join(cwd, name);
+      // chmod follows symlinks, so refuse anything that is not already a
+      // regular file before touching its mode.
+      const staged = await lstat(path);
+      if (staged.isSymbolicLink() || !staged.isFile()) {
+        throw new Error(`${path} is not a regular file`);
+      }
       await chmod(path, 0o600);
       const identity = await assertRegularFileWithMode(path, 0o600);
       if (name === "ca.pem") fileIdentities.caCertificate = identity;

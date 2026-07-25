@@ -12,8 +12,10 @@ const ASSERTION_FRAGMENT = "#ecosystem-assertion";
 // A fixed seed keeps the ecosystem DID document byte-stable across restarts, so
 // the published verification method does not change under a running stack. This
 // is a LOCAL_CONTROLLED fixture key and carries no production meaning.
+// Exactly 32 bytes, as Ed25519 requires; do not rely on the PKCS8 parser to
+// ignore a trailing byte.
 const SEED = Buffer.from(
-  "4c4f43414c5f434f4e54524f4c4c45445f65636f73797374656d5f736565645f31",
+  "4c4f43414c5f434f4e54524f4c4c45445f65636f73797374656d5f736565645f",
   "hex",
 );
 

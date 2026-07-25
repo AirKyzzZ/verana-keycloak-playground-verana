@@ -38,7 +38,9 @@ export interface HostProcessDependencies {
   createResolver: (options: LocalResolverOptions) => {
     listen(port: number, host: string): HostServer;
   };
-  startTlsGateway: (environment: NodeJS.ProcessEnv) => HostServer;
+  startTlsGateway: (
+    environment: NodeJS.ProcessEnv,
+  ) => HostServer | Promise<HostServer>;
   createBrokerApplication: () => Promise<unknown>;
   startBroker: (broker: unknown, port: number) => HostServer;
   createDemoApplication: () => Promise<{ app: unknown }>;
@@ -94,10 +96,28 @@ export function loadTlsMaterial(environment: NodeJS.ProcessEnv): TlsMaterial {
   };
 }
 
-function startControlledTlsGateway(environment: NodeJS.ProcessEnv): HostServer {
+// listen() reports failures such as EADDRINUSE asynchronously, so the handler is
+// attached before binding and startup only resolves once the socket is live.
+async function startControlledTlsGateway(
+  environment: NodeJS.ProcessEnv,
+): Promise<HostServer> {
   const material = loadTlsMaterial(environment);
   const gateway = createLocalTlsProxy(material);
-  gateway.listen(LOCAL_TLS_GATEWAY_PORT, "127.0.0.1");
+
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      gateway.removeListener("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      gateway.removeListener("error", onError);
+      resolve();
+    };
+    gateway.once("error", onError);
+    gateway.once("listening", onListening);
+    gateway.listen(LOCAL_TLS_GATEWAY_PORT, "127.0.0.1");
+  });
+
   return {
     close(callback) {
       closeLocalTlsProxy(gateway).then(
@@ -132,7 +152,7 @@ export async function startHostProcess(
     servers.push(
       dependencies.createResolver(resolverOptions).listen(3099, "127.0.0.1"),
     );
-    servers.push(dependencies.startTlsGateway(environment));
+    servers.push(await dependencies.startTlsGateway(environment));
     const broker = await dependencies.createBrokerApplication();
     servers.push(dependencies.startBroker(broker, 3001));
     const { app } = await dependencies.createDemoApplication();
