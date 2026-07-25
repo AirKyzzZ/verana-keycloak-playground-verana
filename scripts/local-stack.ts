@@ -464,7 +464,9 @@ async function assertCapacity(
     ["info", "--format", "{{json .DriverStatus}}"],
     { cwd: context.root },
   );
-  const availableBytes = capacityFromDockerDriverStatus(driverStatus.stdout);
+  const availableBytes =
+    capacityFromDockerDriverStatus(driverStatus.stdout) ??
+    (await capacityFromColima(context));
   if (availableBytes === undefined) {
     throw new Error(
       "LOCAL_CONTROLLED Docker runtime capacity cannot be determined",
@@ -490,6 +492,74 @@ function capacityFromDockerDriverStatus(output: string): number | undefined {
       typeof entry[1] === "string",
   );
   return available ? parseDockerSize(available[1]) : undefined;
+}
+
+async function capacityFromColima(
+  context: ReturnType<typeof createContext>,
+): Promise<number | undefined> {
+  try {
+    const dockerContext = await context.runner.run(
+      "docker",
+      ["context", "show"],
+      { cwd: context.root },
+    );
+    if (
+      dockerContext.exitCode !== 0 ||
+      dockerContext.stdout.trim() !== "colima"
+    ) {
+      return undefined;
+    }
+    const diskUsage = await context.runner.run(
+      "colima",
+      ["ssh", "--", "df", "-Pk", "/var/lib/docker"],
+      { cwd: context.root },
+    );
+    if (diskUsage.exitCode !== 0) return undefined;
+    return capacityFromPosixDf(diskUsage.stdout);
+  } catch {
+    return undefined;
+  }
+}
+
+function capacityFromPosixDf(output: string): number | undefined {
+  const lines = output.trim().split(/\r?\n/);
+  if (lines.length !== 2) return undefined;
+  const header = lines[0]?.trim().split(/\s+/);
+  if (
+    header?.length !== 7 ||
+    header[0] !== "Filesystem" ||
+    header[1] !== "1024-blocks" ||
+    header[2] !== "Used" ||
+    header[3] !== "Available" ||
+    header[4] !== "Capacity" ||
+    header[5] !== "Mounted" ||
+    header[6] !== "on"
+  ) {
+    return undefined;
+  }
+  const filesystem = lines[1]?.trim().split(/\s+/);
+  if (filesystem?.length !== 6) return undefined;
+  const totalBlocks = parseSafeUnsignedInteger(filesystem[1]);
+  const usedBlocks = parseSafeUnsignedInteger(filesystem[2]);
+  const availableBlocks = parseSafeUnsignedInteger(filesystem[3]);
+  const capacity = /^(\d{1,3})%$/.exec(filesystem[4] ?? "");
+  if (
+    totalBlocks === undefined ||
+    usedBlocks === undefined ||
+    availableBlocks === undefined ||
+    !capacity ||
+    Number(capacity[1]) > 100
+  ) {
+    return undefined;
+  }
+  const availableBytes = availableBlocks * 1024;
+  return Number.isSafeInteger(availableBytes) ? availableBytes : undefined;
+}
+
+function parseSafeUnsignedInteger(value: string | undefined) {
+  if (!value || !/^(0|[1-9]\d*)$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 function parseDockerSize(value: string): number | undefined {

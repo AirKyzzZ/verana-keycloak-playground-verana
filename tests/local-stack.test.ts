@@ -28,6 +28,10 @@ import {
 const roots: string[] = [];
 
 interface FakeBehavior {
+  colimaDf?: string;
+  colimaDfExitCode?: number;
+  dockerContext?: string;
+  dockerContextExitCode?: number;
   driverStatus?: string;
   nodeMajor?: number;
   portOwners?: Partial<Record<number, string>>;
@@ -182,6 +186,28 @@ class FakeRunner implements CommandRunner {
         stderr: "",
       };
     }
+    if (command === "docker" && args[0] === "context") {
+      if (!this.hasExactArgs(args, ["context", "show"])) {
+        throw new Error(`Unexpected fake command: docker ${args.join(" ")}`);
+      }
+      return {
+        exitCode: this.behavior.dockerContextExitCode ?? 0,
+        stdout: `${this.behavior.dockerContext ?? "default"}\n`,
+        stderr: "context command failure details must remain bounded",
+      };
+    }
+    if (command === "colima") {
+      if (
+        !this.hasExactArgs(args, ["ssh", "--", "df", "-Pk", "/var/lib/docker"])
+      ) {
+        throw new Error(`Unexpected fake command: colima ${args.join(" ")}`);
+      }
+      return {
+        exitCode: this.behavior.colimaDfExitCode ?? 0,
+        stdout: this.behavior.colimaDf ?? "",
+        stderr: "colima command failure details must remain bounded",
+      };
+    }
     if (command === "docker" && args[0] === "volume") {
       const project = this.composeProjectFilter(args);
       return {
@@ -248,6 +274,16 @@ class FakeRunner implements CommandRunner {
 
   keycloakUserCount(): number {
     return this.behavior.keycloakUsers ?? 0;
+  }
+
+  private hasExactArgs(
+    actual: readonly string[],
+    expected: readonly string[],
+  ): boolean {
+    return (
+      actual.length === expected.length &&
+      actual.every((value, index) => value === expected[index])
+    );
   }
 
   private composeProjectFilter(args: readonly string[]): string | undefined {
@@ -1057,6 +1093,122 @@ describe("guarded local controlled stack lifecycle", () => {
       "capacity cannot be determined",
     );
     expect(runner.composeUpCalls()).toHaveLength(0);
+  });
+
+  it("uses exact Colima df capacity when containerd DriverStatus omits data space", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      driverStatus: '[["driver-type","io.containerd.snapshotter.v1"]]\n',
+      dockerContext: "colima",
+      colimaDf:
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 62567696 6000000 56558896 10% /\n",
+    });
+
+    await expect(preflight(dependencies(runner, root))).resolves.toEqual({
+      twitterWasRunning: false,
+      vsSourceCommit: "e2bba78746cb2c7ca7f43d28dc9641316f524d24",
+    });
+
+    expect(runner.calls).toContainEqual(["docker", ["context", "show"]]);
+    expect(runner.options).toContainEqual({
+      command: "colima",
+      args: ["ssh", "--", "df", "-Pk", "/var/lib/docker"],
+      options: { cwd: root },
+    });
+  });
+
+  it("rejects insufficient Colima capacity before mutation", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      driverStatus: '[["driver-type","io.containerd.snapshotter.v1"]]\n',
+      dockerContext: "colima",
+      colimaDf:
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000000 1611393 8388607 17% /\n",
+    });
+
+    await expect(preflight(dependencies(runner, root))).rejects.toThrow(
+      "LOCAL_CONTROLLED has insufficient free disk capacity",
+    );
+    expect(runner.composeUpCalls()).toHaveLength(0);
+  });
+
+  it.each([
+    [
+      "missing filesystem row",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n",
+    ],
+    [
+      "ambiguous filesystem rows",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 62567696 6000000 56558896 10% /\n/dev/vda2 62567696 6000000 56558896 10% /var/lib/docker\n",
+    ],
+    [
+      "non-numeric available blocks",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 62567696 6000000 unknown 10% /\n",
+    ],
+    [
+      "unsafe available blocks",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 9007199254740992 0 9007199254740992 0% /\n",
+    ],
+  ])("fails closed for %s in Colima df output", async (_name, colimaDf) => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      driverStatus: '[["driver-type","io.containerd.snapshotter.v1"]]\n',
+      dockerContext: "colima",
+      colimaDf,
+    });
+
+    await expect(preflight(dependencies(runner, root))).rejects.toThrow(
+      "LOCAL_CONTROLLED Docker runtime capacity cannot be determined",
+    );
+    expect(runner.composeUpCalls()).toHaveLength(0);
+  });
+
+  it("does not inspect Colima for a non-Colima Docker context", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      driverStatus: '[["driver-type","io.containerd.snapshotter.v1"]]\n',
+      dockerContext: "desktop-linux",
+    });
+
+    await expect(preflight(dependencies(runner, root))).rejects.toThrow(
+      "LOCAL_CONTROLLED Docker runtime capacity cannot be determined",
+    );
+    expect(runner.calls.some(([command]) => command === "colima")).toBe(false);
+  });
+
+  it.each([
+    ["Docker context command", { dockerContextExitCode: 1 }],
+    ["Colima df command", { dockerContext: "colima", colimaDfExitCode: 1 }],
+  ] satisfies readonly [string, FakeBehavior][])(
+    "fails closed with a static error when the %s fails",
+    async (_name, behavior) => {
+      const root = await makeRoot();
+      const runner = new FakeRunner({
+        driverStatus: '[["driver-type","io.containerd.snapshotter.v1"]]\n',
+        ...behavior,
+      });
+
+      await expect(preflight(dependencies(runner, root))).rejects.toThrow(
+        "LOCAL_CONTROLLED Docker runtime capacity cannot be determined",
+      );
+      expect(runner.composeUpCalls()).toHaveLength(0);
+    },
+  );
+
+  it("preserves the legacy DriverStatus capacity fast path without fallback", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      driverStatus:
+        '[["Backing Filesystem","ext4"],["Data Space Available","30GB"]]\n',
+    });
+
+    await expect(preflight(dependencies(runner, root))).resolves.toEqual({
+      twitterWasRunning: false,
+      vsSourceCommit: "e2bba78746cb2c7ca7f43d28dc9641316f524d24",
+    });
+
+    expect(runner.calls).not.toContainEqual(["docker", ["context", "show"]]);
+    expect(runner.calls.some(([command]) => command === "colima")).toBe(false);
   });
 
   it("chmods an existing lifecycle state file to 0600", async () => {
