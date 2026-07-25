@@ -339,10 +339,7 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       );
       return;
     }
-    if (
-      access.workflow.workflowStatus === "issuing" ||
-      access.workflow.workflowStatus === "sharing"
-    ) {
+    if (isOperationInProgress(access.workflow.workflowStatus)) {
       renderWorkflowConflict(
         context,
         config.EVIDENCE_MODE,

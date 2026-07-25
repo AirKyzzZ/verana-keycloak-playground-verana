@@ -825,6 +825,52 @@ describe("local-holder routes", () => {
     expect(options.walletClient.share).not.toHaveBeenCalled();
   });
 
+  it("rejects a trusted resolve while rogue denial is pending and keeps denial terminal", async () => {
+    let releaseRogue: (() => void) | undefined;
+    const roguePending = new Promise<ResolvedPresentation>((resolve) => {
+      releaseRogue = () => resolve(exactRogueDenial);
+    });
+    const options = createOptions(authorizedIdentity, "LOCAL_CONTROLLED");
+    options.walletClient.testRogueDenial.mockImplementationOnce(
+      async () => await roguePending,
+    );
+    const agent = request.agent(await startDemoServer(options));
+    const token = await openWallet(agent);
+
+    const pendingRogue = walletMutation(
+      agent,
+      "/wallet/test-rogue-denial",
+      token,
+    ).then((response) => response);
+    await vi.waitFor(() => {
+      expect(options.walletClient.testRogueDenial).toHaveBeenCalledOnce();
+    });
+
+    const concurrentResolve = await walletMutation(
+      agent,
+      "/wallet/resolve",
+      token,
+      { authorizationRequest: "openid4vp://trusted-race-request" },
+    );
+    releaseRogue?.();
+    const denied = await pendingRogue;
+    const share = await walletMutation(agent, "/wallet/share", token);
+
+    expect(concurrentResolve.status).toBe(409);
+    expect(concurrentResolve.text).toContain(
+      "Rogue verifier check already in progress",
+    );
+    expect(options.walletClient.resolveRequest).not.toHaveBeenCalled();
+    expect(denied.status).toBe(200);
+    expect(denied.text).toContain("UNTRUSTED");
+    expect(denied.text).toContain("Sharing refused");
+    expect(denied.text).not.toContain("gate-rogue-sensitive");
+    expect(denied.text).not.toContain("Share approved claims");
+    expect(denied.text).not.toContain('action="/wallet/share"');
+    expect(share.status).toBe(409);
+    expect(options.walletClient.share).not.toHaveBeenCalled();
+  });
+
   it("renders one cryptographically random server-bound CSRF token into every wallet form", async () => {
     const agent = request.agent(await startDemoServer());
 
