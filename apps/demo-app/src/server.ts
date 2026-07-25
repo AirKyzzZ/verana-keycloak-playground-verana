@@ -31,7 +31,14 @@ const AUTH_MAX_ENTRIES = 1_024;
 const SESSION_MAX_ENTRIES = 1_024;
 const WALLET_MAX_ENTRIES = 512;
 const CONTROLLED_SUBJECT = "local-controlled-user";
-const CONTROLLED_CLAIMS = ["subject_id", "organization", "role"] as const;
+// The verifier's DCQL pins the credential to the gated VTJSC, so
+// credentialSchema.id is always requested alongside the demo claims.
+const CONTROLLED_CLAIMS = [
+  "credentialSchema.id",
+  "subject_id",
+  "organization",
+  "role",
+] as const;
 
 interface WalletWorkflow extends WalletPageState {
   operationId?: string;

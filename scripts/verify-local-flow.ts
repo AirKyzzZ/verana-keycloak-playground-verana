@@ -15,6 +15,7 @@ const PRESENTATION_RETRY_MS = 500;
 const LIVE_SUBJECT_ID = "call-demo-user";
 const CONTROLLED_SUBJECT_ID = "local-controlled-user";
 const DEFAULT_RESOLVER_URL = "https://resolver.testnet.verana.network";
+const AUTHORIZED_CREDENTIAL_CONFIGURATION_ID = "verana-trusted-attestation";
 const DEFAULT_ISSUER_DID =
   "did:webvh:QmPjKbgpLykjtHGTUfVRNoHra94mjitQsFniXYCTgmNYzG:unfold-org.77.42.86.24.sslip.io";
 const DEFAULT_VERIFIER_DID =
@@ -85,6 +86,7 @@ function v4ParticipationSchemaFor(config: LocalFlowConfig) {
 const capabilitySchema = schema(parseCapability);
 const discoverySchema = schema(parseDiscovery);
 const offerSchema = schema(parseOffer);
+const reviewedOfferSchema = schema(parseReviewedOffer);
 const acceptedBadgeSchema = schema(parseAcceptedBadge);
 const resolutionSchema = schema(parseResolution);
 const sharedSchema = schema(parseShared);
@@ -291,7 +293,7 @@ function verifyControlledConfig(config: LocalFlowConfig): void {
       [config.holderBaseUrl, "http://localhost:3111"],
       [config.issuerBaseUrl, "http://localhost:3101"],
       [config.keycloakIssuer, "http://localhost:8080/realms/verana-playground"],
-      [config.resolverUrl, LOCAL_CONTROLLED.resolverUrl],
+      [config.resolverUrl, LOCAL_CONTROLLED.hostResolverUrl],
       [config.verifierBaseUrl, "http://localhost:3201"],
     ] as const;
     if (exactValues.some(([actual, expected]) => actual !== expected)) {
@@ -507,15 +509,32 @@ async function createAndAcceptBadge(
         subjectId,
         organization: "ACME",
         role: "employee",
+        // Only the authorized configuration carries the credentialSchema the
+        // holder gate requires.
+        credentialConfigurationId: AUTHORIZED_CREDENTIAL_CONFIGURATION_ID,
       }),
       fetchImpl,
       offerSchema,
     );
     const credentialOffer = offer.credentialOffer;
 
+    const reviewed = await requestJson(
+      `${normalizeBaseUrl(config.holderBaseUrl)}/oid4vc-demo/wallet/review-offer`,
+      jsonRequest({ credentialOffer }),
+      fetchImpl,
+      reviewedOfferSchema,
+    );
+    if (
+      reviewed.verdict !== "TRUSTED_AUTHORIZED" ||
+      !reviewed.gateId ||
+      reviewed.issuerDid !== config.expectedIssuerDid
+    ) {
+      throw new Error("issuer_review_not_authorized");
+    }
+
     const accepted = await requestJson(
       `${normalizeBaseUrl(config.holderBaseUrl)}/oid4vc-demo/wallet/accept-offer`,
-      jsonRequest({ credentialOffer }),
+      jsonRequest({ gateId: reviewed.gateId }),
       fetchImpl,
       acceptedBadgeSchema,
     );
@@ -570,9 +589,7 @@ async function runTrustedPresentation(
       resolution.request.verifierDid !== config.expectedVerifierDid ||
       resolution.request.requestedVct !== config.expectedVct ||
       !exactStrings(resolution.request.requestedClaims, [
-        "subject_id",
-        "organization",
-        "role",
+        ...LOCAL_CONTROLLED.requestedClaims,
       ])
     ) {
       throw new Error("holder_denied");
@@ -678,9 +695,7 @@ function isExactControlledRogueDenial(
     resolution.evidence.queries.length === 0 &&
     resolution.request.requestedVct === config.expectedVct &&
     exactStrings(resolution.request.requestedClaims, [
-      "subject_id",
-      "organization",
-      "role",
+      ...LOCAL_CONTROLLED.requestedClaims,
     ])
   );
 }
@@ -882,6 +897,27 @@ function parseOffer(value: unknown): {
       response.issuanceSessionId,
       MAX_IDENTIFIER_LENGTH,
     ),
+  };
+}
+
+function parseReviewedOffer(value: unknown): {
+  gateId: string;
+  verdict: Verdict;
+  issuerDid: string | null;
+} {
+  const response = strictRecord(value, [
+    "credentialIssuer",
+    "evidence",
+    "gateId",
+    "issuerDid",
+    "verdict",
+  ]);
+  parseEvidence(response.evidence);
+  boundedString(response.credentialIssuer, MAX_URL_LENGTH);
+  return {
+    gateId: optionalBoundedString(response.gateId, MAX_IDENTIFIER_LENGTH),
+    verdict: verdict(response.verdict),
+    issuerDid: nullableBoundedString(response.issuerDid, MAX_URL_LENGTH),
   };
 }
 

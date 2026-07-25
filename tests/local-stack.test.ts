@@ -390,6 +390,9 @@ function dependencies(
     runner,
     nodeVersion: "v24.0.0",
     generateData: async () => generatedData(),
+    // The gateway is a real TCP listener in production; the lifecycle tests
+    // exercise ordering, not the socket.
+    waitForGateway: async () => undefined,
     reserveTls: async ({ stagingParent }) => {
       const directory = await mkdtemp(join(stagingParent, "tls-"));
       await chmod(directory, 0o700);
@@ -688,7 +691,7 @@ describe("guarded local controlled stack lifecycle", () => {
     ]);
   });
 
-  it("waits for exact Compose health before semantic checks and host launch", async () => {
+  it("launches the host gateway between the Keycloak and agent Compose stages", async () => {
     const root = await makeRoot();
     const runner = new FakeRunner();
     const events: string[] = [];
@@ -698,7 +701,9 @@ describe("guarded local controlled stack lifecycle", () => {
     if (!fetchImpl || !launch) throw new Error("missing test dependency");
     runner.onRun = (command, args) => {
       if (command === "docker" && args.includes("up")) {
-        events.push("compose-wait");
+        events.push(
+          args.includes("keycloak") ? "keycloak-wait" : "agents-wait",
+        );
       }
     };
     deps.fetch = async (input, init) => {
@@ -707,12 +712,18 @@ describe("guarded local controlled stack lifecycle", () => {
         url ===
         "http://127.0.0.1:8080/realms/verana-playground/.well-known/openid-configuration"
       ) {
-        events.push("semantic-http");
+        events.push("keycloak-http");
+      }
+      if (url === "http://127.0.0.1:3100/v1/health") {
+        events.push("agents-http");
       }
       if (url.endsWith("/protocol/openid-connect/token")) {
         events.push("zero-user");
       }
       return await fetchImpl(input, init);
+    };
+    deps.waitForGateway = async () => {
+      events.push("gateway-ready");
     };
     deps.launch = async (options) => {
       events.push("host-launch");
@@ -721,36 +732,37 @@ describe("guarded local controlled stack lifecycle", () => {
 
     await up(deps);
 
+    const composeArgv = [
+      "compose",
+      "--project-name",
+      "verana-keycloak-local-controlled",
+      "--env-file",
+      ".data/local-controlled.env",
+      "-f",
+      "compose.yaml",
+      "-f",
+      "compose.local-controlled.yaml",
+      "up",
+      "--wait",
+      "--wait-timeout",
+      "180",
+      "--force-recreate",
+    ];
     expect(runner.composeUpCalls()).toEqual([
-      [
-        "docker",
-        [
-          "compose",
-          "--project-name",
-          "verana-keycloak-local-controlled",
-          "--env-file",
-          ".data/local-controlled.env",
-          "-f",
-          "compose.yaml",
-          "-f",
-          "compose.local-controlled.yaml",
-          "up",
-          "--wait",
-          "--wait-timeout",
-          "180",
-          "--force-recreate",
-          "keycloak",
-          "issuer",
-          "holder",
-          "verifier",
-        ],
-      ],
+      ["docker", [...composeArgv, "keycloak"]],
+      ["docker", [...composeArgv, "issuer", "holder", "verifier"]],
     ]);
+    // The agents resolve did:web, VCT and VTJSC through the host TLS gateway
+    // while they start, so the gateway must accept connections before Compose
+    // brings them up. Keycloak has no such dependency and starts first.
     expect(events).toEqual([
-      "compose-wait",
-      "semantic-http",
-      "zero-user",
+      "keycloak-wait",
+      "keycloak-http",
       "host-launch",
+      "gateway-ready",
+      "agents-wait",
+      "agents-http",
+      "zero-user",
     ]);
   });
 
@@ -789,9 +801,6 @@ describe("guarded local controlled stack lifecycle", () => {
           "180",
           "--force-recreate",
           "keycloak",
-          "issuer",
-          "holder",
-          "verifier",
         ],
       ],
     ]);
@@ -1660,6 +1669,7 @@ describe("guarded local controlled stack lifecycle", () => {
       "docker",
       ["start", "twitter-bot-vs-agent"],
     ]);
+    await expect(readdir(join(root, ".data"))).resolves.toEqual([]);
   });
 
   it("fails closed and tears down when Keycloak already has a user", async () => {

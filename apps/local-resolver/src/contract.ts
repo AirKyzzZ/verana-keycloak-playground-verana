@@ -8,6 +8,15 @@ export const ORGANIZATION_CREDENTIAL_SCHEMA_ID = 251;
 
 export const LINKED_VP_SERVICE_FRAGMENT = "#vpr-schemas-249-vtjsc-vp";
 
+// The agent requires Linked-VP evidence for every configured fragment, and
+// evaluates them as a set: one missing fragment downgrades the party to
+// UNTRUSTED. Each fragment therefore gets its own presentation.
+export const LINKED_VP_SERVICE_FRAGMENTS = [
+  "#vpr-schemas-service-vtc-vp",
+  "#vpr-schemas-org-vtc-vp",
+  LINKED_VP_SERVICE_FRAGMENT,
+] as const;
+
 const GATEWAY_ORIGIN = "https://resolver.localhost:3443";
 
 export const LOCAL_CONTROLLED_CONTRACT = Object.freeze({
@@ -132,24 +141,45 @@ function ecsCredentials(did: string): unknown[] {
 // makes the agent downgrade the party to UNTRUSTED.
 function presentations(did: string, withCredentialIds: boolean): unknown[] {
   const participantId = participantIdFor(did);
-  return [
-    {
-      id: `${GATEWAY_ORIGIN}/presentations/${participantId}-vtjsc-vp.jwt`,
-      serviceId: `${did}${LINKED_VP_SERVICE_FRAGMENT}`,
-      vtcCredentials: [
-        {
-          id: LOCAL_CONTROLLED_CONTRACT.vtjscId,
-          credentialSchemaId: CREDENTIAL_SCHEMA_ID,
-          ecosystemId: ECOSYSTEM_ID,
-          participantId,
-          issuerParticipantId: PARTICIPANT_IDS.ecosystem,
-        },
-      ],
-      ...(withCredentialIds
-        ? { unresolvableCredentialIds: [], invalidCredentialIds: [] }
-        : {}),
-    },
-  ];
+  const credentialIds = withCredentialIds
+    ? { unresolvableCredentialIds: [], invalidCredentialIds: [] }
+    : {};
+
+  const vtcFor = (fragment: string) => {
+    if (fragment === "#vpr-schemas-service-vtc-vp") {
+      return {
+        id: `${GATEWAY_ORIGIN}/credentials/ecs-service-${participantId}`,
+        credentialSchemaId: SERVICE_CREDENTIAL_SCHEMA_ID,
+        ecosystemId: ECOSYSTEM_ID,
+        participantId: PARTICIPANT_IDS.serviceCredential,
+        issuerParticipantId: PARTICIPANT_IDS.serviceCredentialIssuer,
+      };
+    }
+    if (fragment === "#vpr-schemas-org-vtc-vp") {
+      return {
+        id: `${GATEWAY_ORIGIN}/credentials/ecs-org-${participantId}`,
+        credentialSchemaId: ORGANIZATION_CREDENTIAL_SCHEMA_ID,
+        ecosystemId: ECOSYSTEM_ID,
+        participantId: PARTICIPANT_IDS.organizationCredential,
+        issuerParticipantId: PARTICIPANT_IDS.organizationCredentialIssuer,
+      };
+    }
+    // The gated tuple: this is the VTC the agent matches on.
+    return {
+      id: LOCAL_CONTROLLED_CONTRACT.vtjscId,
+      credentialSchemaId: CREDENTIAL_SCHEMA_ID,
+      ecosystemId: ECOSYSTEM_ID,
+      participantId,
+      issuerParticipantId: PARTICIPANT_IDS.ecosystem,
+    };
+  };
+
+  return LINKED_VP_SERVICE_FRAGMENTS.map((fragment) => ({
+    id: `${GATEWAY_ORIGIN}/presentations/${participantId}${fragment.replace("#", "-")}.jwt`,
+    serviceId: `${did}${fragment}`,
+    vtcCredentials: [vtcFor(fragment)],
+    ...credentialIds,
+  }));
 }
 
 // Per the request schema, services[] carries only NON-LinkedVerifiablePresentation

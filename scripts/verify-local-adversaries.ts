@@ -346,7 +346,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
-    await runLocalAdversaries(process.argv.slice(2));
+    const passedArguments = process.argv.slice(2);
+    const arguments_ = passedArguments.some((argument) =>
+      argument.startsWith("--expect-count="),
+    )
+      ? passedArguments
+      : ["--expect-count=0", ...passedArguments];
+    await runLocalAdversaries(arguments_);
   } catch {
     console.error("FAIL LOCAL_CONTROLLED ADVERSARIAL");
     process.exitCode = 1;

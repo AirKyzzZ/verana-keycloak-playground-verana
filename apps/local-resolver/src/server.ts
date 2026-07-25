@@ -185,8 +185,9 @@ export function createLocalResolver(options: LocalResolverOptions = {}): Koa {
     ctx.body = ecosystemDidDocument();
   });
 
-  router.get("/presentations/:participantId-vtjsc-vp.jwt", (ctx) => {
-    const holderDid = PRESENTATION_HOLDERS[ctx.params.participantId ?? ""];
+  router.get("/presentations/:name.jwt", (ctx) => {
+    const participantId = (ctx.params.name ?? "").split("-")[0] ?? "";
+    const holderDid = PRESENTATION_HOLDERS[participantId];
     if (!holderDid) {
       ctx.status = 404;
       ctx.body = { error: "not_found" };

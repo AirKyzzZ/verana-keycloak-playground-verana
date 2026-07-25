@@ -173,6 +173,9 @@ export class LocalWalletClient implements LocalWalletClientContract {
           subjectId,
           organization: "ACME",
           role: "employee",
+          // Only this configuration carries the credentialSchema the holder's
+          // gate checks against the gated registry tuple.
+          credentialConfigurationId: "verana-trusted-attestation",
         }),
       },
       issuedBadgeResponseSchema,

@@ -4,6 +4,7 @@ import {
   CREDENTIAL_SCHEMA_ID,
   ECOSYSTEM_ID,
   LINKED_VP_SERVICE_FRAGMENT,
+  LINKED_VP_SERVICE_FRAGMENTS,
   LOCAL_CONTROLLED_CONTRACT,
 } from "../src/contract.js";
 import {
@@ -132,23 +133,38 @@ describe("controlled local v4 trust resolver", () => {
     ).toBe(false);
   });
 
-  it("serves complete Linked-VP evidence for a trusted party", async () => {
+  // The agent evaluates the required fragments as a SET: one missing fragment
+  // downgrades the whole party to UNTRUSTED.
+  it("serves one Linked-VP presentation per required fragment", async () => {
     const response = await resolver().post(RESOLVE_PATH).send(q1Body(ISSUER));
 
-    expect(response.body.presentations).toHaveLength(1);
-    const presentation = response.body.presentations[0];
-    expect(presentation.serviceId).toBe(
-      `${ISSUER}${LINKED_VP_SERVICE_FRAGMENT}`,
+    const served = (response.body.presentations as { serviceId: string }[]).map(
+      (presentation) => presentation.serviceId,
     );
-    expect(presentation.unresolvableCredentialIds).toEqual([]);
-    expect(presentation.invalidCredentialIds).toEqual([]);
-    expect(
+    expect(served).toEqual(
+      LINKED_VP_SERVICE_FRAGMENTS.map((fragment) => `${ISSUER}${fragment}`),
+    );
+
+    for (const presentation of response.body.presentations) {
+      expect(presentation.unresolvableCredentialIds).toEqual([]);
+      expect(presentation.invalidCredentialIds).toEqual([]);
+    }
+
+    // Exactly one presentation carries the gated (ecosystem, schema) tuple.
+    const gated = (
+      response.body.presentations as {
+        serviceId: string;
+        vtcCredentials: { ecosystemId: number; credentialSchemaId: number }[];
+      }[]
+    ).filter((presentation) =>
       presentation.vtcCredentials.some(
-        (reference: { ecosystemId: number; credentialSchemaId: number }) =>
+        (reference) =>
           reference.ecosystemId === ECOSYSTEM_ID &&
           reference.credentialSchemaId === CREDENTIAL_SCHEMA_ID,
       ),
-    ).toBe(true);
+    );
+    expect(gated).toHaveLength(1);
+    expect(gated[0]?.serviceId).toBe(`${ISSUER}${LINKED_VP_SERVICE_FRAGMENT}`);
   });
 
   it("serves the ECS service and organization credentials", async () => {
@@ -432,9 +448,11 @@ describe("ecosystem DID document and Linked VP", () => {
       resolver().get("/presentations/2-vtjsc-vp.jwt"),
     ]);
 
-    expect(trust.body.presentations[0].id).toContain(
-      "/presentations/2-vtjsc-vp.jwt",
-    );
+    expect(
+      (trust.body.presentations as { id: string }[]).some((presentation) =>
+        presentation.id.includes("/presentations/2-"),
+      ),
+    ).toBe(true);
     // services[] must carry only non-LinkedVerifiablePresentation entries.
     for (const service of trust.body.services as { type: string }[]) {
       expect(service.type).not.toBe("LinkedVerifiablePresentation");

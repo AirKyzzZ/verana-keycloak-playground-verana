@@ -169,7 +169,12 @@ describe("LocalWalletClient", () => {
             unverifiedClaimedDid: "did:web:verifier.localhost%3A3443:rogue",
             requestedVct:
               "https://resolver.localhost:3443/vct/local-controlled-employee",
-            requestedClaims: ["subject_id", "organization", "role"],
+            requestedClaims: [
+              "credentialSchema.id",
+              "subject_id",
+              "organization",
+              "role",
+            ],
           },
         },
       };
@@ -277,6 +282,7 @@ describe("LocalWalletClient", () => {
           subjectId: "local-user",
           organization: "ACME",
           role: "employee",
+          credentialConfigurationId: "verana-trusted-attestation",
         },
         method: "POST",
         path: "/oid4vc-demo/offers",

@@ -27,7 +27,7 @@ services:
       VERANA_NETWORK_ID: local-controlled
       VERANA_ECOSYSTEM_ID: "184"
       VERANA_CREDENTIAL_SCHEMA_ID: "249"
-      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443":"did:web:issuer.localhost%3A3443"}'
+      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443/oid4vci/unfold":"did:web:issuer.localhost%3A3443"}'
       OID4VC_REQUIRED_LINKED_VP_FRAGMENTS: "#vpr-schemas-service-vtc-vp,#vpr-schemas-org-vtc-vp,#vpr-schemas-249-vtjsc-vp"
       VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
       UNFOLD_VCT: ${UNFOLD_VCT}
@@ -72,7 +72,7 @@ services:
       VERANA_NETWORK_ID: local-controlled
       VERANA_ECOSYSTEM_ID: "184"
       VERANA_CREDENTIAL_SCHEMA_ID: "249"
-      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443":"did:web:issuer.localhost%3A3443"}'
+      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443/oid4vci/unfold":"did:web:issuer.localhost%3A3443"}'
       OID4VC_REQUIRED_LINKED_VP_FRAGMENTS: "#vpr-schemas-service-vtc-vp,#vpr-schemas-org-vtc-vp,#vpr-schemas-249-vtjsc-vp"
       VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
       UNFOLD_VCT: ${UNFOLD_VCT}
@@ -117,7 +117,7 @@ services:
       VERANA_NETWORK_ID: local-controlled
       VERANA_ECOSYSTEM_ID: "184"
       VERANA_CREDENTIAL_SCHEMA_ID: "249"
-      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443":"did:web:issuer.localhost%3A3443"}'
+      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443/oid4vci/unfold":"did:web:issuer.localhost%3A3443"}'
       OID4VC_REQUIRED_LINKED_VP_FRAGMENTS: "#vpr-schemas-service-vtc-vp,#vpr-schemas-org-vtc-vp,#vpr-schemas-249-vtjsc-vp"
       VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
       UNFOLD_VCT: ${UNFOLD_VCT}

@@ -115,7 +115,12 @@ const exactRogueDenial: ResolvedPresentation = {
     verifierDid: null,
     unverifiedClaimedDid: CONTROLLED_ROGUE_DID,
     requestedVct: CONTROLLED_VCT,
-    requestedClaims: ["subject_id", "organization", "role"],
+    requestedClaims: [
+      "credentialSchema.id",
+      "subject_id",
+      "organization",
+      "role",
+    ],
   },
 };
 

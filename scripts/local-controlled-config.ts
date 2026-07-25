@@ -15,13 +15,29 @@ export const LOCAL_CONTROLLED = Object.freeze({
   verifierDid: "did:web:verifier.localhost%3A3443",
   rogueDid: "did:web:verifier.localhost%3A3443:rogue",
   ecosystemDid: "did:web:resolver.localhost%3A3443:ecosystem",
+  // Containers reach the resolver through the TLS gateway; host-side processes
+  // and verification scripts talk to it directly on loopback, because the
+  // gateway's per-run private CA is deliberately not in any host trust store.
   resolverUrl: "https://resolver.localhost:3443",
+  hostResolverUrl: "http://localhost:3099",
   vct: "https://resolver.localhost:3443/vct/local-controlled-employee",
   vtjscId:
     "https://resolver.localhost:3443/vtjsc/local-controlled-employee.json",
+  // The binding key is the exact OID4VCI credential issuer identifier, which
+  // carries the issuer path, not merely the origin. An origin-only key never
+  // matches and every offer is refused as unbound.
   credentialIssuerBindings: Object.freeze({
-    "https://issuer.localhost:3443": "did:web:issuer.localhost%3A3443",
+    "https://issuer.localhost:3443/oid4vci/unfold":
+      "did:web:issuer.localhost%3A3443",
   }),
+  // The verifier's DCQL pins the credential to the gated VTJSC, so
+  // credentialSchema.id is always requested alongside the demo claims.
+  requestedClaims: Object.freeze([
+    "credentialSchema.id",
+    "subject_id",
+    "organization",
+    "role",
+  ]),
   requiredLinkedVpFragments: Object.freeze([
     "#vpr-schemas-service-vtc-vp",
     "#vpr-schemas-org-vtc-vp",

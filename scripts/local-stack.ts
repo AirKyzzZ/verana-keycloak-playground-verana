@@ -10,6 +10,7 @@ import {
   rename,
   rm,
 } from "node:fs/promises";
+import { connect } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sanitizeKeycloakStatus } from "./keycloak-status.js";
@@ -22,6 +23,7 @@ import {
   reserveLocalTlsBundle,
   type SerializedFileIdentity,
 } from "./local-tls-certificates.js";
+import { LOCAL_TLS_GATEWAY_PORT } from "./local-tls-proxy.js";
 import {
   createLocalControlledData,
   type LocalControlledDataFiles,
@@ -126,6 +128,7 @@ export interface LifecycleDependencies {
   createTls?: (options: {
     reservation: LocalTlsReservation;
   }) => Promise<LocalTlsBundle>;
+  waitForGateway?: () => Promise<void>;
   afterTempFileOpen?: (opened: {
     path: string;
     label: string;
@@ -234,6 +237,12 @@ export async function up(
     currentState = await establishTlsMaterial(context, currentState);
     await assertPublishedCaCertificate(context, currentState);
 
+    // Startup is three ordered stages because the dependencies run both ways.
+    // Keycloak first: the demo app performs OIDC discovery against it while it
+    // starts. Then the host process, which owns the controlled resolver and the
+    // TLS gateway. Then the agents, which resolve their did:web, VCT and VTJSC
+    // documents through that gateway as they start, and would otherwise die
+    // with ECONNREFUSED.
     const composeState = { ...currentState, composeTouched: true };
     await writeState(context, composeState);
     currentState = composeState;
@@ -245,12 +254,8 @@ export async function up(
       "180",
       "--force-recreate",
       "keycloak",
-      "issuer",
-      "holder",
-      "verifier",
     ]);
-    await waitForContainerServices(context.fetch);
-    await assertZeroKeycloakUsers(context.fetch);
+    await waitForKeycloak(context.fetch);
 
     const startToken = context.randomToken();
     const environment = await loadSanitizedEnvironment(
@@ -266,8 +271,20 @@ export async function up(
     });
     currentState = { ...currentState, hostProcess };
     await writeState(context, currentState);
+    await waitForHostServices(context.fetch, context.waitForGateway);
 
-    await waitForHostServices(context.fetch);
+    await runCompose(context, [
+      "up",
+      "--wait",
+      "--wait-timeout",
+      "180",
+      "--force-recreate",
+      "issuer",
+      "holder",
+      "verifier",
+    ]);
+    await waitForAgentServices(context.fetch);
+    await assertZeroKeycloakUsers(context.fetch);
     context.write(
       "LOCAL_CONTROLLED stack active; browser authentication not verified",
     );
@@ -406,6 +423,7 @@ function createContext(dependencies: LifecycleDependencies) {
     runner: dependencies.runner ?? systemRunner,
     generateData: dependencies.generateData ?? createLocalControlledData,
     reserveTls: dependencies.reserveTls ?? reserveLocalTlsBundle,
+    waitForGateway: dependencies.waitForGateway ?? waitForTlsGateway,
     createTls: dependencies.createTls ?? createLocalTlsBundle,
     afterTempFileOpen:
       dependencies.afterTempFileOpen ?? (async () => undefined),
@@ -779,11 +797,16 @@ async function assertNoAmbiguousComposeState(
   }
 }
 
-async function waitForContainerServices(
-  fetchImpl: typeof fetch,
-): Promise<void> {
+// Keycloak is an ordinary IdP with no dependency on the controlled gateway, so
+// it starts first and lets the demo app complete OIDC discovery.
+async function waitForKeycloak(fetchImpl: typeof fetch): Promise<void> {
   await waitForUrls(fetchImpl, [
     "http://127.0.0.1:8080/realms/verana-playground/.well-known/openid-configuration",
+  ]);
+}
+
+async function waitForAgentServices(fetchImpl: typeof fetch): Promise<void> {
+  await waitForUrls(fetchImpl, [
     "http://127.0.0.1:3100/v1/health",
     "http://127.0.0.1:3101/oid4vc-demo/capabilities",
     "http://127.0.0.1:3110/v1/health",
@@ -793,12 +816,49 @@ async function waitForContainerServices(
   ]);
 }
 
-async function waitForHostServices(fetchImpl: typeof fetch): Promise<void> {
+async function waitForContainerServices(
+  fetchImpl: typeof fetch,
+): Promise<void> {
+  await waitForKeycloak(fetchImpl);
+  await waitForAgentServices(fetchImpl);
+}
+
+// The gateway terminates TLS with a per-run private CA, so readiness is a TCP
+// accept rather than an HTTP probe: a fetch would fail certificate validation
+// before proving anything about the listener.
+async function waitForTlsGateway(): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const accepted = await new Promise<boolean>((resolveAccepted) => {
+      const socket = connect(LOCAL_TLS_GATEWAY_PORT, "127.0.0.1");
+      const settle = (value: boolean) => {
+        socket.destroy();
+        resolveAccepted(value);
+      };
+      socket.once("connect", () => settle(true));
+      socket.once("error", () => settle(false));
+      socket.setTimeout(2_000, () => settle(false));
+    });
+    if (accepted) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        "LOCAL_CONTROLLED TLS gateway did not accept connections before the deadline",
+      );
+    }
+    await new Promise((wait) => setTimeout(wait, 500));
+  }
+}
+
+async function waitForHostServices(
+  fetchImpl: typeof fetch,
+  waitForGateway: () => Promise<void>,
+): Promise<void> {
   await waitForUrls(fetchImpl, [
     "http://127.0.0.1:3099/health",
     "http://127.0.0.1:3001/.well-known/openid-configuration",
     "http://127.0.0.1:3000/",
   ]);
+  await waitForGateway();
 }
 
 async function assertZeroKeycloakUsers(fetchImpl: typeof fetch): Promise<void> {

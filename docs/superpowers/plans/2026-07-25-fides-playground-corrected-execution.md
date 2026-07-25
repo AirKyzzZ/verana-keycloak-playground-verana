@@ -395,6 +395,37 @@ CA, gets real v4 verdicts, and cannot accept or share without a valid gate.
 
 ---
 
+## Startup ordering — discovered by running it, 2026-07-25
+
+The dependencies run in BOTH directions, so startup has three ordered stages.
+Getting this wrong makes the stack unstartable, and the original single
+`compose up --wait` for all four services could never have succeeded:
+
+1. **Keycloak first.** `createDemoApplication()` performs OIDC discovery against
+   Keycloak while it starts (`apps/demo-app/src/keycloak-client.ts`). Keycloak
+   itself has no dependency on the controlled gateway.
+2. **Then the host process.** It owns the controlled resolver on 3099 AND the
+   loopback TLS gateway on 3443. Readiness must include a TCP probe of 3443:
+   an HTTP probe cannot work, because the gateway presents a per-run private CA.
+3. **Then the three agents.** They resolve their `did:web` documents, VCT and
+   VTJSC through the gateway as they start. Started before it, every one dies
+   with `connect ECONNREFUSED 192.168.5.2:3443` — that address is the host as
+   seen from inside Colima.
+
+`teardown()` already stops the host process before `compose down`, so a Compose
+failure at stage 3 does not leak the host process.
+
+Two traps when debugging this by hand:
+
+- **Docker creates a missing bind-mount source as a DIRECTORY.** Running Compose
+  without the TLS material present leaves `.data/tls/ca.pem` as an empty
+  directory, which then trips the "refuses to replace existing TLS material"
+  guard on every later run. Remove `.data/tls` before retrying.
+- **The guarded teardown deletes containers and `.data` faster than you can read
+  them.** To see why a container or the host process died, either run one service
+  under a throwaway `--project-name`, or copy `.data/**/host-process.log` in a
+  loop while the run is in flight.
+
 ## Phase E — Live local and real-Chrome evidence
 
 **Files:** playground verification scripts, `docs/evidence/README.md`.
