@@ -106,10 +106,15 @@ export interface KeycloakUserSummary {
   roles: string[];
 }
 
+export type KeycloakUserStatus =
+  | { count: 0 }
+  | { count: 1; user: KeycloakUserSummary };
+
 export interface KeycloakVerificationOptions {
   adminPassword?: string;
   adminUsername?: string;
   baseUrl?: string;
+  expectedCount?: 0 | 1;
   fetch?: typeof fetch;
   realm?: string;
 }
@@ -139,30 +144,68 @@ export async function readKeycloakUsers(
   );
 
   return await Promise.all(
-    users.map(async (user) => {
-      const encodedId = encodeURIComponent(user.id);
-      const userBaseUrl = `${baseUrl}/admin/realms/${encodeURIComponent(realm)}/users/${encodedId}`;
-      const [groups, roles] = await Promise.all([
-        requestKeycloakJson(
-          `${userBaseUrl}/groups`,
-          { headers: { authorization: `Bearer ${accessToken}` } },
+    users.map(
+      async (user) =>
+        await readKeycloakUserDetails(
+          user,
+          baseUrl,
+          realm,
+          accessToken,
           fetchImpl,
         ),
-        requestKeycloakJson(
-          `${userBaseUrl}/role-mappings/realm/composite`,
-          { headers: { authorization: `Bearer ${accessToken}` } },
-          fetchImpl,
-        ),
-      ]);
-      return {
-        id: user.id,
-        username: user.username,
-        veranaSubject: user.veranaSubject,
-        groups: parseNamedValues(groups, "path"),
-        roles: parseNamedValues(roles, "name"),
-      };
-    }),
+    ),
   );
+}
+
+export async function readKeycloakUserStatus(
+  options: KeycloakVerificationOptions = {},
+): Promise<KeycloakUserStatus> {
+  const fetchImpl = options.fetch ?? fetch;
+  const baseUrl = normalizeBaseUrl(
+    options.baseUrl ?? DEFAULT_KEYCLOAK_BASE_URL,
+  );
+  const realm = options.realm ?? DEFAULT_KEYCLOAK_REALM;
+  const accessToken = await readAdminAccessToken({
+    adminPassword: options.adminPassword ?? DEFAULT_ADMIN_PASSWORD,
+    adminUsername: options.adminUsername ?? DEFAULT_ADMIN_USERNAME,
+    baseUrl,
+    fetchImpl,
+  });
+  const realmUsersUrl = `${baseUrl}/admin/realms/${encodeURIComponent(realm)}/users`;
+  const count = parseControlledUserCount(
+    await requestKeycloakJson(
+      `${realmUsersUrl}/count`,
+      { headers: { authorization: `Bearer ${accessToken}` } },
+      fetchImpl,
+    ),
+  );
+  if (options.expectedCount !== undefined && count !== options.expectedCount) {
+    throw new Error("Keycloak user count mismatch");
+  }
+  if (count === 0) return { count: 0 };
+
+  const users = parseUsers(
+    await requestKeycloakJson(
+      `${realmUsersUrl}?first=0&max=1&briefRepresentation=true`,
+      { headers: { authorization: `Bearer ${accessToken}` } },
+      fetchImpl,
+    ),
+  );
+  if (users.length !== 1) {
+    throw new Error("Keycloak user response is invalid");
+  }
+  const user = users[0];
+  if (!user) throw new Error("Keycloak user response is invalid");
+  return {
+    count: 1,
+    user: await readKeycloakUserDetails(
+      user,
+      baseUrl,
+      realm,
+      accessToken,
+      fetchImpl,
+    ),
+  };
 }
 
 export async function assertKeycloakUserCount(
@@ -215,6 +258,40 @@ async function readAdminAccessToken({
     throw new Error("Keycloak admin token response is invalid");
   }
   return token.access_token;
+}
+
+async function readKeycloakUserDetails(
+  user: {
+    id: string;
+    username: string;
+    veranaSubject: string | null;
+  },
+  baseUrl: string,
+  realm: string,
+  accessToken: string,
+  fetchImpl: typeof fetch,
+): Promise<KeycloakUserSummary> {
+  const encodedId = encodeURIComponent(user.id);
+  const userBaseUrl = `${baseUrl}/admin/realms/${encodeURIComponent(realm)}/users/${encodedId}`;
+  const [groups, roles] = await Promise.all([
+    requestKeycloakJson(
+      `${userBaseUrl}/groups`,
+      { headers: { authorization: `Bearer ${accessToken}` } },
+      fetchImpl,
+    ),
+    requestKeycloakJson(
+      `${userBaseUrl}/role-mappings/realm/composite`,
+      { headers: { authorization: `Bearer ${accessToken}` } },
+      fetchImpl,
+    ),
+  ]);
+  return {
+    id: user.id,
+    username: user.username,
+    veranaSubject: user.veranaSubject,
+    groups: parseNamedValues(groups, "path"),
+    roles: parseNamedValues(roles, "name"),
+  };
 }
 
 async function requestKeycloakJson(
@@ -338,6 +415,11 @@ function parseUsers(value: unknown): Array<{
     }
     return { id: entry.id, username: entry.username, veranaSubject };
   });
+}
+
+function parseControlledUserCount(value: unknown): 0 | 1 {
+  if (value === 0 || value === 1) return value;
+  throw new Error("Keycloak user count is outside the controlled bound");
 }
 
 function parseNamedValues(value: unknown, field: "name" | "path"): string[] {

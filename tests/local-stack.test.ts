@@ -284,6 +284,10 @@ class FakeRunner implements CommandRunner {
     return this.behavior.keycloakUsers ?? 0;
   }
 
+  setKeycloakUserCount(count: number): void {
+    this.behavior.keycloakUsers = count;
+  }
+
   private hasExactArgs(
     actual: readonly string[],
     expected: readonly string[],
@@ -323,7 +327,11 @@ async function makeRoot(): Promise<string> {
 }
 
 function generatedData(
-  environment = "PAIRWISE_SUB_SECRET=test-secret-at-least-32-characters\n",
+  environment = [
+    "PAIRWISE_SUB_SECRET=test-secret-at-least-32-characters",
+    "LOCAL_RESOLVER_CONTROL_TOKEN=test-control-token-with-at-least-thirty-two-bytes",
+    "",
+  ].join("\n"),
 ) {
   return {
     ".env": environment,
@@ -337,6 +345,7 @@ function dependencies(
   runner: FakeRunner,
   root: string,
   options: {
+    fetchCalls?: string[];
     launchFails?: boolean;
     signals?: number[];
     output?: string[];
@@ -356,13 +365,32 @@ function dependencies(
     signalProcessGroup: (pid) => signals.push(pid),
     fetch: async (input) => {
       const url = String(input);
+      options.fetchCalls?.push(url);
       if (url.endsWith("/protocol/openid-connect/token")) {
         return Response.json({ access_token: "local-admin-token" });
       }
-      if (url.includes("/admin/realms/verana-playground/users")) {
+      if (url.endsWith("/admin/realms/verana-playground/users/count")) {
+        return Response.json(runner.keycloakUserCount());
+      }
+      if (url.includes("/admin/realms/verana-playground/users?")) {
         return Response.json(
-          Array.from({ length: runner.keycloakUserCount() }, () => ({})),
+          Array.from({ length: runner.keycloakUserCount() }, () => ({
+            attributes: {
+              verana_subject: ["stable-pairwise-subject"],
+            },
+            id: "user-1",
+            username: "pairwise-user",
+          })),
         );
+      }
+      if (url.endsWith("/groups")) {
+        return Response.json([{ path: "/organizations/acme" }]);
+      }
+      if (url.endsWith("/role-mappings/realm/composite")) {
+        return Response.json([{ name: "employee" }]);
+      }
+      if (url.endsWith("/_local-controlled/resolver-fault")) {
+        return Response.json({ armed: false });
       }
       return new Response("{}", { status: 200 });
     },
@@ -501,7 +529,11 @@ describe("guarded local controlled stack lifecycle", () => {
 
     expect(receivedSourcePath).toBe("/tmp/reviewed-vs-agent");
     await expect(readFile(join(root, ".data", ".env"), "utf8")).resolves.toBe(
-      "PAIRWISE_SUB_SECRET=test-secret-at-least-32-characters\n",
+      [
+        "PAIRWISE_SUB_SECRET=test-secret-at-least-32-characters",
+        "LOCAL_RESOLVER_CONTROL_TOKEN=test-control-token-with-at-least-thirty-two-bytes",
+        "",
+      ].join("\n"),
     );
   });
 
@@ -1360,6 +1392,53 @@ describe("guarded local controlled stack lifecycle", () => {
     expect(output.join("\n")).toContain("LOCAL_CONTROLLED ports clear");
   });
 
+  it("reports inactive lifecycle and ports without reading Keycloak or fault state", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const output: string[] = [];
+    const fetchCalls: string[] = [];
+    const deps = dependencies(runner, root, { fetchCalls, output });
+
+    const stackStatus = await status(deps);
+
+    expect(stackStatus).toEqual({ active: false, portsClear: true });
+    expect(output).toEqual([
+      "LOCAL_CONTROLLED lifecycle inactive",
+      "LOCAL_CONTROLLED ports clear",
+    ]);
+    expect(fetchCalls).toEqual([]);
+  });
+
+  it("reports active lifecycle, occupied ports, sanitized users, and resolver fault state", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const output: string[] = [];
+    const deps = dependencies(runner, root, { output });
+
+    await up(deps);
+    output.length = 0;
+    runner.setKeycloakUserCount(1);
+
+    const stackStatus = await status(deps);
+
+    expect(stackStatus.active).toBe(true);
+    expect(stackStatus.portsClear).toBe(false);
+    expect(output).toEqual([
+      "LOCAL_CONTROLLED lifecycle active",
+      "LOCAL_CONTROLLED ports occupied",
+      "KEYCLOAK USERS 1",
+      "KEYCLOAK ACCOUNT_REF d35e6a2d30889d691db09e7ddfb36bb8c9caed53280837677f06ff679063b9d5",
+      "KEYCLOAK SUBJECT_REF 5761b53b080a93a620e96186f669be72eae400da4619c50f74cc70dab26c6f2e",
+      "PASS KEYCLOAK GROUP ACME",
+      "PASS KEYCLOAK ROLE employee",
+      "PASS KEYCLOAK SUBJECT mapped",
+      "LOCAL_CONTROLLED resolver fault unarmed",
+    ]);
+    expect(output.join("\n")).not.toMatch(
+      /user-1|pairwise-user|stable-pairwise-subject|test-control-token|credential|cookie|secret/i,
+    );
+  });
+
   it("scopes cleanup and restoration after a partial startup failure", async () => {
     const root = await makeRoot();
     const runner = new FakeRunner({ twitterRunning: true });
@@ -1405,8 +1484,15 @@ describe("guarded local controlled stack lifecycle", () => {
 
     expect(output.join("\n")).toContain("LOCAL_CONTROLLED");
     expect(output.join("\n")).toContain("http://127.0.0.1:3000");
+    expect(output.join("\n")).toContain(
+      "LOCAL_CONTROLLED stack active; browser authentication not verified",
+    );
+    expect(output.join("\n")).not.toContain("browser authentication verified");
     expect(output.join("\n")).not.toContain(
       "test-secret-at-least-32-characters",
+    );
+    expect(output.join("\n")).not.toContain(
+      "test-control-token-with-at-least-thirty-two-bytes",
     );
   });
 });

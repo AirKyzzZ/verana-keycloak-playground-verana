@@ -9,9 +9,28 @@ const ROGUE = "did:web:rogue.localhost";
 const VCT = "http://host.docker.internal:3099/vct/local-controlled-employee";
 const VTJSC =
   "http://host.docker.internal:3099/vtjsc/local-controlled-employee.json";
+const CONTROL_TOKEN =
+  "test-control-token-with-at-least-thirty-two-bytes-of-entropy";
+const CONTROL_PATH = "/_local-controlled/resolver-fault";
 
 function resolver() {
   return request(createLocalResolver().callback());
+}
+
+function controlledResolver(now: () => number = () => Date.now()) {
+  return request(
+    createLocalResolver({
+      controlToken: CONTROL_TOKEN,
+      evidenceMode: "LOCAL_CONTROLLED",
+      now,
+    }).callback(),
+  );
+}
+
+function authorize<T extends { set(name: string, value: string): T }>(
+  operation: T,
+): T {
+  return operation.set("authorization", `Bearer ${CONTROL_TOKEN}`);
 }
 
 describe("controlled local trust resolver", () => {
@@ -153,4 +172,134 @@ describe("controlled local trust resolver", () => {
       expect(response.body).toEqual({ error: "not_found" });
     },
   );
+});
+
+describe("controlled local resolver faults", () => {
+  it("does not register control routes without both explicit controlled mode and a token", async () => {
+    const withoutOptions = await resolver().get(CONTROL_PATH);
+    const liveWithToken = await request(
+      createLocalResolver({
+        controlToken: CONTROL_TOKEN,
+        evidenceMode: "LIVE_VERANA",
+      }).callback(),
+    )
+      .get(CONTROL_PATH)
+      .set("authorization", `Bearer ${CONTROL_TOKEN}`);
+
+    expect(withoutOptions.status).toBe(404);
+    expect(liveWithToken.status).toBe(404);
+  });
+
+  it("requires the exact bearer token without reflecting rejected credentials", async () => {
+    const missing = await controlledResolver().get(CONTROL_PATH);
+    const rejectedToken = "different-control-token-that-must-not-be-reflected";
+    const wrong = await controlledResolver()
+      .get(CONTROL_PATH)
+      .set("authorization", `Bearer ${rejectedToken}`);
+
+    expect(missing.status).toBe(401);
+    expect(wrong.status).toBe(401);
+    expect(missing.body).toEqual({ error: "unauthorized" });
+    expect(wrong.body).toEqual({ error: "unauthorized" });
+    expect(wrong.text).not.toContain(rejectedToken);
+    expect(wrong.text).not.toContain(CONTROL_TOKEN);
+  });
+
+  it("targets only the next exact verifier Q1 request and consumes before responding", async () => {
+    const agent = controlledResolver();
+
+    const armed = await authorize(agent.post(`${CONTROL_PATH}/unavailable`));
+    const issuerQ1 = await agent
+      .get("/v1/trust/resolve")
+      .query({ did: ISSUER });
+    const verifierQ3 = await agent
+      .get("/v1/trust/verifier-authorization")
+      .query({ did: VERIFIER, vtjscId: VTJSC });
+    const verifierQ1 = await agent
+      .get("/v1/trust/resolve")
+      .query({ did: VERIFIER });
+    const statusAfterFault = await authorize(agent.get(CONTROL_PATH));
+    const verifierRetry = await agent
+      .get("/v1/trust/resolve")
+      .query({ did: VERIFIER });
+
+    expect(armed.status).toBe(201);
+    expect(issuerQ1.body).toEqual({
+      did: ISSUER,
+      trustStatus: "TRUSTED",
+      production: true,
+    });
+    expect(verifierQ3.body.authorized).toBe(true);
+    expect(verifierQ1.status).toBe(503);
+    expect(Buffer.byteLength(verifierQ1.text)).toBeLessThan(1_024);
+    expect(verifierQ1.body).toEqual({ error: "resolver_unavailable" });
+    expect(statusAfterFault.body).toEqual({ armed: false });
+    expect(verifierRetry.status).toBe(200);
+    expect(verifierRetry.body.trustStatus).toBe("TRUSTED");
+  });
+
+  it.each(["malformed-json", "oversized-body"] as const)(
+    "serves one exact %s fault and then restores normal Q1",
+    async (mode) => {
+      const agent = controlledResolver();
+      await authorize(agent.post(`${CONTROL_PATH}/${mode}`)).expect(201);
+
+      const fault = await agent
+        .get("/v1/trust/resolve")
+        .query({ did: VERIFIER })
+        .buffer(true)
+        .parse((response, callback) => {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk: Buffer) => chunks.push(chunk));
+          response.on("end", () =>
+            callback(null, Buffer.concat(chunks).toString("utf8")),
+          );
+        });
+      const retry = await agent
+        .get("/v1/trust/resolve")
+        .query({ did: VERIFIER });
+
+      expect(fault.status).toBe(200);
+      expect(fault.type).toBe("application/json");
+      if (mode === "malformed-json") {
+        expect(fault.body).toBe('{"did":');
+      } else {
+        expect(Buffer.byteLength(fault.body as string)).toBeGreaterThan(65_536);
+      }
+      expect(retry.status).toBe(200);
+      expect(retry.body.trustStatus).toBe("TRUSTED");
+    },
+  );
+
+  it("expires an armed fault after thirty seconds", async () => {
+    let now = Date.parse("2026-07-25T00:00:00.000Z");
+    const agent = controlledResolver(() => now);
+    await authorize(agent.post(`${CONTROL_PATH}/unavailable`)).expect(201);
+
+    now += 30_001;
+    const status = await authorize(agent.get(CONTROL_PATH));
+    const verifierQ1 = await agent
+      .get("/v1/trust/resolve")
+      .query({ did: VERIFIER });
+
+    expect(status.body).toEqual({ armed: false });
+    expect(verifierQ1.status).toBe(200);
+  });
+
+  it("rejects overwrite while armed and supports authenticated reset", async () => {
+    const agent = controlledResolver();
+    await authorize(agent.post(`${CONTROL_PATH}/unavailable`)).expect(201);
+
+    const overwrite = await authorize(
+      agent.post(`${CONTROL_PATH}/malformed-json`),
+    );
+    const reset = await authorize(agent.delete(CONTROL_PATH));
+    const status = await authorize(agent.get(CONTROL_PATH));
+
+    expect(overwrite.status).toBe(409);
+    expect(overwrite.body).toEqual({ error: "fault_already_armed" });
+    expect(reset.status).toBe(200);
+    expect(reset.body).toEqual({ armed: false });
+    expect(status.body).toEqual({ armed: false });
+  });
 });

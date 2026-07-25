@@ -82,4 +82,26 @@ describe("generateLocalControlledData", () => {
       await rm(output, { recursive: true, force: true });
     }
   });
+
+  it("keeps a high-entropy resolver control token only in the host environment", async () => {
+    const output = await mkdtemp(join(tmpdir(), "verana-keycloak-controlled-"));
+    try {
+      await generateLocalControlledData(output, VS_SOURCE);
+      const hostEnvironment = parseEnv(
+        await readFile(join(output, ".env"), "utf8"),
+      );
+      const composeEnvironment = await readFile(
+        join(output, "local-controlled.env"),
+        "utf8",
+      );
+      const token = hostEnvironment.LOCAL_RESOLVER_CONTROL_TOKEN;
+
+      expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(composeEnvironment).not.toContain("LOCAL_RESOLVER_CONTROL_TOKEN");
+      expect(composeEnvironment).not.toContain(token);
+      expect((await stat(join(output, ".env"))).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(output, { recursive: true, force: true });
+    }
+  });
 });

@@ -12,12 +12,14 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-
+import { sanitizeKeycloakStatus } from "./keycloak-status.js";
+import { readKeycloakUserStatus } from "./keycloak-verification.js";
 import { LOCAL_CONTROLLED } from "./local-controlled-config.js";
 import {
   createLocalControlledData,
   type LocalControlledDataFiles,
 } from "./setup-local-controlled.js";
+import { readResolverFaultStatus } from "./verify-local-adversaries.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataDirectoryName = ".data";
@@ -228,6 +230,9 @@ export async function up(
     await writeState(context, currentState);
 
     await waitForHostServices(context.fetch);
+    context.write(
+      "LOCAL_CONTROLLED stack active; browser authentication not verified",
+    );
     context.write("LOCAL_CONTROLLED http://127.0.0.1:3000");
     context.write("LOCAL_CONTROLLED http://127.0.0.1:3001");
     context.write("LOCAL_CONTROLLED http://127.0.0.1:3099/health");
@@ -253,7 +258,37 @@ export async function status(
   const context = createContext(dependencies);
   const currentState = await readState(context);
   const portsClear = await portsAreClear(context.runner);
-  if (portsClear) context.write("LOCAL_CONTROLLED ports clear");
+  context.write(
+    currentState
+      ? "LOCAL_CONTROLLED lifecycle active"
+      : "LOCAL_CONTROLLED lifecycle inactive",
+  );
+  context.write(
+    portsClear
+      ? "LOCAL_CONTROLLED ports clear"
+      : "LOCAL_CONTROLLED ports occupied",
+  );
+  if (currentState) {
+    const keycloakStatus = await readKeycloakUserStatus({
+      fetch: context.fetch,
+    });
+    const sanitized = sanitizeKeycloakStatus(
+      { expectedCount: keycloakStatus.count },
+      keycloakStatus,
+    );
+    for (const line of sanitized.lines) context.write(line);
+
+    const controlToken = await readResolverControlToken(context.dataDirectory);
+    const faultStatus = await readResolverFaultStatus(
+      controlToken,
+      context.fetch,
+    );
+    context.write(
+      faultStatus.armed
+        ? `LOCAL_CONTROLLED resolver fault armed ${faultStatus.mode ?? "unknown"}`
+        : "LOCAL_CONTROLLED resolver fault unarmed",
+    );
+  }
   return {
     active: currentState !== undefined,
     portsClear,
@@ -261,6 +296,21 @@ export async function status(
       ? { twitterWasRunning: currentState.twitterWasRunning }
       : {}),
   };
+}
+
+async function readResolverControlToken(
+  dataDirectory: string,
+): Promise<string> {
+  const environment = parseEnvironment(
+    await readFile(join(dataDirectory, ".env"), "utf8"),
+  );
+  const token = environment.LOCAL_RESOLVER_CONTROL_TOKEN;
+  if (typeof token !== "string" || token.length < 43) {
+    throw new Error(
+      "LOCAL_CONTROLLED resolver control configuration is invalid",
+    );
+  }
+  return token;
 }
 
 export async function down(

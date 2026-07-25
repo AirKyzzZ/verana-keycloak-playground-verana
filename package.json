@@ -10,6 +10,8 @@
     "local:status": "tsx scripts/local-stack.ts status",
     "local:down": "tsx scripts/local-stack.ts down",
     "local:verify": "tsx scripts/verify-local-flow.ts",
+    "local:users": "tsx scripts/keycloak-status.ts",
+    "local:adversarial": "tsx scripts/verify-local-adversaries.ts",
     "dev": "pnpm --parallel --filter @verana-playground/broker --filter @verana-playground/demo-app dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",

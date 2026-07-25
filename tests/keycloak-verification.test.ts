@@ -9,6 +9,7 @@ import {
   assertKeycloakUserCount,
   assertSecretMatch,
   parseLocalSecrets,
+  readKeycloakUserStatus,
   readKeycloakUsers,
 } from "../scripts/keycloak-verification.js";
 
@@ -212,6 +213,90 @@ describe("Keycloak verification helpers", () => {
     ).rejects.toThrowError("Keycloak user count mismatch");
   });
 
+  it("counts first and reads at most one account through read-only endpoints", async () => {
+    const keycloak = await startKeycloakFixture([
+      {
+        id: "user-1",
+        username: "pairwise-user",
+        attributes: {
+          verana_subject: ["stable-pairwise-subject"],
+        },
+      },
+    ]);
+
+    await expect(
+      readKeycloakUserStatus({ baseUrl: keycloak.baseUrl }),
+    ).resolves.toEqual({
+      count: 1,
+      user: {
+        id: "user-1",
+        username: "pairwise-user",
+        veranaSubject: "stable-pairwise-subject",
+        groups: ["/organizations/acme"],
+        roles: ["employee"],
+      },
+    });
+
+    expect(keycloak.requests().slice(0, 3)).toEqual([
+      "POST /realms/master/protocol/openid-connect/token",
+      "GET /admin/realms/verana-playground/users/count",
+      "GET /admin/realms/verana-playground/users?first=0&max=1&briefRepresentation=true",
+    ]);
+    expect(keycloak.requests().slice(3).sort()).toEqual([
+      "GET /admin/realms/verana-playground/users/user-1/groups",
+      "GET /admin/realms/verana-playground/users/user-1/role-mappings/realm/composite",
+    ]);
+  });
+
+  it("does not read account details when the exact count is zero or unsupported", async () => {
+    const empty = await startKeycloakFixture([]);
+    const mismatched = await startKeycloakFixture([
+      {
+        id: "user-1",
+        username: "pairwise-user",
+        attributes: {
+          verana_subject: ["stable-pairwise-subject"],
+        },
+      },
+    ]);
+    const tooMany = await startKeycloakFixture([
+      {
+        id: "user-1",
+        username: "first",
+      },
+      {
+        id: "user-2",
+        username: "second",
+      },
+    ]);
+
+    await expect(
+      readKeycloakUserStatus({ baseUrl: empty.baseUrl }),
+    ).resolves.toEqual({ count: 0 });
+    await expect(
+      readKeycloakUserStatus({
+        baseUrl: mismatched.baseUrl,
+        expectedCount: 0,
+      }),
+    ).rejects.toThrow("Keycloak user count mismatch");
+    await expect(
+      readKeycloakUserStatus({ baseUrl: tooMany.baseUrl }),
+    ).rejects.toThrow("Keycloak user count is outside the controlled bound");
+
+    expect(empty.requests()).toEqual([
+      "POST /realms/master/protocol/openid-connect/token",
+      "GET /admin/realms/verana-playground/users/count",
+    ]);
+    expect(mismatched.requests()).toEqual([
+      "POST /realms/master/protocol/openid-connect/token",
+      "GET /admin/realms/verana-playground/users/count",
+    ]);
+    expect(tooMany.requests()).toEqual([
+      "POST /realms/master/protocol/openid-connect/token",
+      "GET /admin/realms/verana-playground/users/count",
+    ]);
+  });
+
   it("rejects malformed Keycloak user attributes without leaking token bodies", async () => {
     const keycloak = await startKeycloakFixture([
       {
@@ -242,14 +327,19 @@ describe("Keycloak verification helpers", () => {
 interface KeycloakFixture {
   authorizationHeaders(): string[];
   baseUrl: string;
+  requests(): string[];
 }
 
 async function startKeycloakFixture(
   users: ReadonlyArray<Record<string, unknown>>,
 ): Promise<KeycloakFixture> {
   const authorizationHeaders: string[] = [];
+  const requests: string[] = [];
   const server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    requests.push(
+      `${request.method ?? "UNKNOWN"} ${url.pathname}${url.search}`,
+    );
     if (
       request.method === "POST" &&
       url.pathname === "/realms/master/protocol/openid-connect/token"
@@ -283,6 +373,13 @@ async function startKeycloakFixture(
       response
         .writeHead(200, { "content-type": "application/json" })
         .end(JSON.stringify(users));
+      return;
+    }
+
+    if (url.pathname === "/admin/realms/verana-playground/users/count") {
+      response
+        .writeHead(200, { "content-type": "application/json" })
+        .end(JSON.stringify(users.length));
       return;
     }
 
@@ -339,5 +436,6 @@ async function startKeycloakFixture(
   return {
     authorizationHeaders: () => authorizationHeaders,
     baseUrl: `http://127.0.0.1:${address.port}`,
+    requests: () => requests,
   };
 }
