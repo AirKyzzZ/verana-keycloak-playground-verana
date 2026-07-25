@@ -13,8 +13,8 @@ services:
     environment:
       ADMIN_PORT: 3000
       AGENT_PORT: 3001
-      AGENT_PUBLIC_DID: did:web:issuer.localhost
-      PUBLIC_API_BASE_URL: http://host.docker.internal:3101
+      AGENT_PUBLIC_DID: did:web:issuer.localhost%3A3443
+      PUBLIC_API_BASE_URL: https://issuer.localhost:3443
       AGENT_ENDPOINTS: ws://host.docker.internal:3101
       AGENT_WALLET_ID: ${ISSUER_WALLET_ID}
       AGENT_WALLET_KEY: ${ISSUER_WALLET_KEY}
@@ -22,15 +22,27 @@ services:
       OID4VC_ISSUER_ENABLED: "true"
       OID4VC_HOLDER_ENABLED: "false"
       OID4VC_VERIFIER_ENABLED: "false"
-      OID4VC_REQUEST_SIGNER: x5c
-      OID4VC_ISSUER_SIGNER: x5c
+      OID4VC_REQUEST_SIGNER: did
+      OID4VC_ISSUER_SIGNER: did
+      VERANA_NETWORK_ID: local-controlled
+      VERANA_ECOSYSTEM_ID: "184"
+      VERANA_CREDENTIAL_SCHEMA_ID: "249"
+      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443":"did:web:issuer.localhost%3A3443"}'
+      OID4VC_REQUIRED_LINKED_VP_FRAGMENTS: "#vpr-schemas-service-vtc-vp,#vpr-schemas-org-vtc-vp,#vpr-schemas-249-vtjsc-vp"
       VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
       UNFOLD_VCT: ${UNFOLD_VCT}
       UNFOLD_VTJSC_ID: ${UNFOLD_VTJSC_ID}
       ROGUE_VERIFIER_DID: ${ROGUE_VERIFIER_DID}
-    extra_hosts: ["host.docker.internal:host-gateway"]
+      NODE_EXTRA_CA_CERTS: /run/verana-local-ca/ca.pem
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "issuer.localhost:host-gateway"
+      - "holder.localhost:host-gateway"
+      - "verifier.localhost:host-gateway"
+      - "resolver.localhost:host-gateway"
     volumes:
       - issuer-afj:/root/.afj
+      - ./.data/tls/ca.pem:/run/verana-local-ca/ca.pem:ro
     healthcheck:
       test: ["CMD-SHELL", "node -e \"Promise.all(['http://127.0.0.1:3000/v1/health', 'http://127.0.0.1:3001/oid4vc-demo/capabilities'].map((url) => fetch(url))).then((responses) => process.exit(responses.every((response) => response.ok) ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 5s
@@ -46,8 +58,8 @@ services:
     environment:
       ADMIN_PORT: 3000
       AGENT_PORT: 3001
-      AGENT_PUBLIC_DID: did:web:holder.localhost
-      PUBLIC_API_BASE_URL: http://host.docker.internal:3111
+      AGENT_PUBLIC_DID: did:web:holder.localhost%3A3443
+      PUBLIC_API_BASE_URL: https://holder.localhost:3443
       AGENT_ENDPOINTS: ws://host.docker.internal:3111
       AGENT_WALLET_ID: ${HOLDER_WALLET_ID}
       AGENT_WALLET_KEY: ${HOLDER_WALLET_KEY}
@@ -55,15 +67,27 @@ services:
       OID4VC_ISSUER_ENABLED: "false"
       OID4VC_HOLDER_ENABLED: "true"
       OID4VC_VERIFIER_ENABLED: "false"
-      OID4VC_REQUEST_SIGNER: x5c
-      OID4VC_ISSUER_SIGNER: x5c
+      OID4VC_REQUEST_SIGNER: did
+      OID4VC_ISSUER_SIGNER: did
+      VERANA_NETWORK_ID: local-controlled
+      VERANA_ECOSYSTEM_ID: "184"
+      VERANA_CREDENTIAL_SCHEMA_ID: "249"
+      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443":"did:web:issuer.localhost%3A3443"}'
+      OID4VC_REQUIRED_LINKED_VP_FRAGMENTS: "#vpr-schemas-service-vtc-vp,#vpr-schemas-org-vtc-vp,#vpr-schemas-249-vtjsc-vp"
       VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
       UNFOLD_VCT: ${UNFOLD_VCT}
       UNFOLD_VTJSC_ID: ${UNFOLD_VTJSC_ID}
       ROGUE_VERIFIER_DID: ${ROGUE_VERIFIER_DID}
-    extra_hosts: ["host.docker.internal:host-gateway"]
+      NODE_EXTRA_CA_CERTS: /run/verana-local-ca/ca.pem
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "issuer.localhost:host-gateway"
+      - "holder.localhost:host-gateway"
+      - "verifier.localhost:host-gateway"
+      - "resolver.localhost:host-gateway"
     volumes:
       - holder-afj:/root/.afj
+      - ./.data/tls/ca.pem:/run/verana-local-ca/ca.pem:ro
     healthcheck:
       test: ["CMD-SHELL", "node -e \"Promise.all(['http://127.0.0.1:3000/v1/health', 'http://127.0.0.1:3001/oid4vc-demo/capabilities'].map((url) => fetch(url))).then((responses) => process.exit(responses.every((response) => response.ok) ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 5s
@@ -79,8 +103,8 @@ services:
     environment:
       ADMIN_PORT: 3000
       AGENT_PORT: 3001
-      AGENT_PUBLIC_DID: did:web:verifier.localhost
-      PUBLIC_API_BASE_URL: http://host.docker.internal:3201
+      AGENT_PUBLIC_DID: did:web:verifier.localhost%3A3443
+      PUBLIC_API_BASE_URL: https://verifier.localhost:3443
       AGENT_ENDPOINTS: ws://host.docker.internal:3201
       AGENT_WALLET_ID: ${VERIFIER_WALLET_ID}
       AGENT_WALLET_KEY: ${VERIFIER_WALLET_KEY}
@@ -88,15 +112,27 @@ services:
       OID4VC_ISSUER_ENABLED: "false"
       OID4VC_HOLDER_ENABLED: "false"
       OID4VC_VERIFIER_ENABLED: "true"
-      OID4VC_REQUEST_SIGNER: x5c
-      OID4VC_ISSUER_SIGNER: x5c
+      OID4VC_REQUEST_SIGNER: did
+      OID4VC_ISSUER_SIGNER: did
+      VERANA_NETWORK_ID: local-controlled
+      VERANA_ECOSYSTEM_ID: "184"
+      VERANA_CREDENTIAL_SCHEMA_ID: "249"
+      OID4VC_CREDENTIAL_ISSUER_BINDINGS_JSON: '{"https://issuer.localhost:3443":"did:web:issuer.localhost%3A3443"}'
+      OID4VC_REQUIRED_LINKED_VP_FRAGMENTS: "#vpr-schemas-service-vtc-vp,#vpr-schemas-org-vtc-vp,#vpr-schemas-249-vtjsc-vp"
       VERANA_RESOLVER_URL: ${VERANA_RESOLVER_URL}
       UNFOLD_VCT: ${UNFOLD_VCT}
       UNFOLD_VTJSC_ID: ${UNFOLD_VTJSC_ID}
       ROGUE_VERIFIER_DID: ${ROGUE_VERIFIER_DID}
-    extra_hosts: ["host.docker.internal:host-gateway"]
+      NODE_EXTRA_CA_CERTS: /run/verana-local-ca/ca.pem
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "issuer.localhost:host-gateway"
+      - "holder.localhost:host-gateway"
+      - "verifier.localhost:host-gateway"
+      - "resolver.localhost:host-gateway"
     volumes:
       - verifier-afj:/root/.afj
+      - ./.data/tls/ca.pem:/run/verana-local-ca/ca.pem:ro
     healthcheck:
       test: ["CMD-SHELL", "node -e \"Promise.all(['http://127.0.0.1:3000/v1/health', 'http://127.0.0.1:3001/oid4vc-demo/capabilities'].map((url) => fetch(url))).then((responses) => process.exit(responses.every((response) => response.ok) ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 5s

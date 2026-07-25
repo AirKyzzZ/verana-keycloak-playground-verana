@@ -18,8 +18,9 @@ const VTJSC = "https://issuer.example/vt/badge.json";
 const SUBJECT = "call-demo-user";
 const CONTROLLED_SUBJECT = "local-controlled-user";
 const SENSITIVE_MARKER = "raw-secret-presentation-token";
-const ROGUE_Q1_QUERY =
-  "http://host.docker.internal:3099/v1/trust/resolve?did=did%3Aweb%3Arogue.localhost";
+const ROGUE_Q1_QUERY = `${LOCAL_CONTROLLED.resolverUrl}/resolve?did=${encodeURIComponent(
+  LOCAL_CONTROLLED.rogueDid,
+)}`;
 
 interface FakeBehavior {
   capability?: {

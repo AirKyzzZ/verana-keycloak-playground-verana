@@ -335,6 +335,29 @@ async function makeRoot(): Promise<string> {
   return root;
 }
 
+const bundleFiles = [
+  "ca.pem",
+  "ca-key.pem",
+  "server.pem",
+  "server-key.pem",
+] as const;
+
+async function serializedIdentity(
+  path: string,
+): Promise<{ dev: string; ino: string }> {
+  const details = await stat(path);
+  return { dev: String(details.dev), ino: String(details.ino) };
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function generatedData(
   environment = [
     "PAIRWISE_SUB_SECRET=test-secret-at-least-32-characters",
@@ -367,6 +390,36 @@ function dependencies(
     runner,
     nodeVersion: "v24.0.0",
     generateData: async () => generatedData(),
+    reserveTls: async ({ stagingParent }) => {
+      const directory = await mkdtemp(join(stagingParent, "tls-"));
+      await chmod(directory, 0o700);
+      return { directory, identity: await serializedIdentity(directory) };
+    },
+    createTls: async ({ reservation }) => {
+      for (const file of bundleFiles) {
+        await writeFile(join(reservation.directory, file), `${file}\n`, {
+          mode: 0o600,
+        });
+      }
+      return {
+        ...reservation,
+        caCertificatePath: join(reservation.directory, "ca.pem"),
+        caPrivateKeyPath: join(reservation.directory, "ca-key.pem"),
+        serverCertificatePath: join(reservation.directory, "server.pem"),
+        serverPrivateKeyPath: join(reservation.directory, "server-key.pem"),
+        fileIdentities: {
+          caCertificate: await serializedIdentity(
+            join(reservation.directory, "ca.pem"),
+          ),
+          serverCertificate: await serializedIdentity(
+            join(reservation.directory, "server.pem"),
+          ),
+          serverPrivateKey: await serializedIdentity(
+            join(reservation.directory, "server-key.pem"),
+          ),
+        },
+      };
+    },
     launch: async ({ startToken }) => {
       if (options.launchFails) throw new Error("host start failed");
       return { pid: 4242, startToken };
@@ -841,10 +894,11 @@ describe("guarded local controlled stack lifecycle", () => {
         await readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
       ),
     ).toMatchObject({
-      version: 1,
+      version: 2,
       composeProject: "verana-keycloak-local-controlled",
       twitterWasRunning: true,
       hostProcess: { pid: 4242, startToken: "verified-start-token" },
+      ownedTls: { phase: "published" },
     });
   });
 
@@ -1445,7 +1499,7 @@ describe("guarded local controlled stack lifecycle", () => {
     await writeFile(
       statePath,
       JSON.stringify({
-        version: 1,
+        version: 2,
         composeProject: "verana-keycloak-local-controlled",
         twitterWasRunning: false,
         twitterStopped: false,
@@ -1572,6 +1626,7 @@ describe("guarded local controlled stack lifecycle", () => {
     expect(output).toEqual([
       "LOCAL_CONTROLLED lifecycle active",
       "LOCAL_CONTROLLED ports occupied",
+      "LOCAL_CONTROLLED TLS material published",
       "KEYCLOAK USERS 1",
       "KEYCLOAK ACCOUNT_REF d35e6a2d30889d691db09e7ddfb36bb8c9caed53280837677f06ff679063b9d5",
       "KEYCLOAK SUBJECT_REF 5761b53b080a93a620e96186f669be72eae400da4619c50f74cc70dab26c6f2e",
@@ -1639,6 +1694,166 @@ describe("guarded local controlled stack lifecycle", () => {
     );
     expect(output.join("\n")).not.toContain(
       "test-control-token-with-at-least-thirty-two-bytes",
+    );
+  });
+
+  it("journals the TLS reservation before any key material exists", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    const createTls = deps.createTls;
+    if (!createTls) throw new Error("missing test dependency");
+    let journalled: unknown;
+    let publishedTooEarly = true;
+    deps.createTls = async (options) => {
+      journalled = JSON.parse(
+        await readFile(join(root, ".data", "local-stack-state.json"), "utf8"),
+      );
+      publishedTooEarly = await exists(join(root, ".data", "tls"));
+      return await createTls(options);
+    };
+
+    await up(deps);
+
+    expect(publishedTooEarly).toBe(false);
+    expect(journalled).toMatchObject({
+      version: 2,
+      ownedTls: { phase: "reserved" },
+    });
+    expect(journalled).not.toMatchObject({ ownedTls: { fileIdentities: {} } });
+  });
+
+  it("publishes the bundle and injects only host TLS paths", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    let environment: NodeJS.ProcessEnv | undefined;
+    deps.launch = async ({ startToken, environment: launched }) => {
+      environment = launched;
+      return { pid: 4242, startToken };
+    };
+
+    await up(deps);
+
+    const tlsDirectory = join(root, ".data", "tls");
+    expect((await readdir(tlsDirectory)).sort()).toEqual(
+      [...bundleFiles].sort(),
+    );
+    expect(environment?.LOCAL_TLS_CERTIFICATE_PATH).toBe(
+      join(tlsDirectory, "server.pem"),
+    );
+    expect(environment?.LOCAL_TLS_PRIVATE_KEY_PATH).toBe(
+      join(tlsDirectory, "server-key.pem"),
+    );
+    expect(
+      JSON.parse(environment?.LOCAL_TLS_CERTIFICATE_IDENTITY ?? "null"),
+    ).toEqual(await serializedIdentity(join(tlsDirectory, "server.pem")));
+    expect(
+      JSON.parse(environment?.LOCAL_TLS_PRIVATE_KEY_IDENTITY ?? "null"),
+    ).toEqual(await serializedIdentity(join(tlsDirectory, "server-key.pem")));
+  });
+
+  it("deletes every generated TLS file without touching the Twitter container", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+
+    await up(deps);
+    runner.setHostToken("verified-start-token");
+    await down(deps);
+
+    expect(await exists(join(root, ".data", "tls"))).toBe(false);
+    await expect(readdir(join(root, ".data"))).resolves.toEqual([]);
+    expect(
+      runner.calls.filter(
+        ([command, args]) =>
+          command === "docker" && (args[0] === "stop" || args[0] === "start"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("removes a journalled reservation when certificate generation fails", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    deps.createTls = async () => {
+      throw new Error("openssl generation failed");
+    };
+
+    await expect(up(deps)).rejects.toThrow("openssl generation failed");
+
+    await expect(readdir(join(root, ".data"))).resolves.toEqual([]);
+    expect(
+      runner
+        .composeCalls()
+        .filter(([, args]) => args.includes("build") || args.includes("up")),
+    ).toEqual([]);
+  });
+
+  it("refuses a replaced CA bind source before Compose", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    const createTls = deps.createTls;
+    if (!createTls) throw new Error("missing test dependency");
+    deps.createTls = async (options) => {
+      const bundle = await createTls(options);
+      await rm(bundle.caCertificatePath);
+      await writeFile(bundle.caCertificatePath, "replaced ca\n", {
+        mode: 0o600,
+      });
+      return bundle;
+    };
+
+    await expect(up(deps)).rejects.toThrow(
+      "TLS bind source changed before Compose",
+    );
+
+    await expect(readdir(join(root, ".data"))).resolves.toEqual([]);
+    expect(
+      runner
+        .composeCalls()
+        .filter(([, args]) => args.includes("build") || args.includes("up")),
+    ).toEqual([]);
+  });
+
+  it("refuses to replace existing TLS material", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    const preexisting = join(root, ".data", "tls");
+    await mkdir(preexisting);
+    await writeFile(join(preexisting, "keep.pem"), "keep me");
+
+    await expect(up(deps)).rejects.toThrow(
+      "refuses to replace existing TLS material",
+    );
+
+    await expect(readFile(join(preexisting, "keep.pem"), "utf8")).resolves.toBe(
+      "keep me",
+    );
+  });
+
+  it("refuses a generated environment that overrides host TLS material", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner();
+    const deps = dependencies(runner, root);
+    deps.generateData = async () =>
+      generatedData("LOCAL_TLS_PRIVATE_KEY_PATH=/tmp/rogue-key.pem\n");
+
+    await expect(up(deps)).rejects.toThrow(
+      "host environment override is forbidden: LOCAL_TLS_PRIVATE_KEY_PATH",
+    );
+  });
+
+  it("guards the TLS gateway port before startup", async () => {
+    const root = await makeRoot();
+    const runner = new FakeRunner({
+      portOwners: { 3443: "unrelated-gateway" },
+    });
+
+    await expect(preflight(dependencies(runner, root))).rejects.toThrow(
+      "port 3443 is occupied by unrelated-gateway",
     );
   });
 });

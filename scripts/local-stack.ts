@@ -10,11 +10,18 @@ import {
   rename,
   rm,
 } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sanitizeKeycloakStatus } from "./keycloak-status.js";
 import { readKeycloakUserStatus } from "./keycloak-verification.js";
 import { LOCAL_CONTROLLED } from "./local-controlled-config.js";
+import {
+  createLocalTlsBundle,
+  type LocalTlsBundle,
+  type LocalTlsReservation,
+  reserveLocalTlsBundle,
+  type SerializedFileIdentity,
+} from "./local-tls-certificates.js";
 import {
   createLocalControlledData,
   type LocalControlledDataFiles,
@@ -25,6 +32,16 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataDirectoryName = ".data";
 const stateFileName = "local-stack-state.json";
 const lifecycleDirectoryName = "local-stack";
+const tlsDirectoryName = "tls";
+const tlsCaCertificateName = "ca.pem";
+const tlsServerCertificateName = "server.pem";
+const tlsServerPrivateKeyName = "server-key.pem";
+const hostTlsEnvironmentNames = [
+  "LOCAL_TLS_CERTIFICATE_PATH",
+  "LOCAL_TLS_PRIVATE_KEY_PATH",
+  "LOCAL_TLS_CERTIFICATE_IDENTITY",
+  "LOCAL_TLS_PRIVATE_KEY_IDENTITY",
+] as const;
 const generatedDataFiles = [
   ".env",
   "local-controlled.env",
@@ -64,14 +81,23 @@ interface TemporaryFile {
   identity: FileSystemIdentity;
 }
 
+interface OwnedTlsState {
+  identity: SerializedFileIdentity;
+  stagingName: string;
+  phase: "reserved" | "published";
+  fileIdentities?: LocalTlsBundle["fileIdentities"];
+}
+
 interface LocalStackState {
-  version: 1;
+  version: 2;
   composeProject: typeof LOCAL_CONTROLLED.composeProject;
   twitterWasRunning: boolean;
   twitterStopped: boolean;
   composeTouched: boolean;
   hostProcess?: HostProcess;
   ownedDataFiles: readonly (typeof generatedDataFiles)[number][];
+  ownedLifecycleDirectory?: SerializedFileIdentity;
+  ownedTls?: OwnedTlsState;
   vsSourceCommit: string;
   startedAt: string;
 }
@@ -94,6 +120,12 @@ export interface LifecycleDependencies {
   nodeVersion?: string;
   runner?: CommandRunner;
   generateData?: (vsSourcePath: string) => Promise<LocalControlledDataFiles>;
+  reserveTls?: (options: {
+    stagingParent: string;
+  }) => Promise<LocalTlsReservation>;
+  createTls?: (options: {
+    reservation: LocalTlsReservation;
+  }) => Promise<LocalTlsBundle>;
   afterTempFileOpen?: (opened: {
     path: string;
     label: string;
@@ -173,7 +205,7 @@ export async function up(
   const context = createContext(dependencies);
   const checked = await preflight(dependencies);
   const initialState: LocalStackState = {
-    version: 1,
+    version: 2,
     composeProject: LOCAL_CONTROLLED.composeProject,
     twitterWasRunning: checked.twitterWasRunning,
     twitterStopped: false,
@@ -199,6 +231,9 @@ export async function up(
       await writeState(context, currentState);
     }
 
+    currentState = await establishTlsMaterial(context, currentState);
+    await assertPublishedCaCertificate(context, currentState);
+
     const composeState = { ...currentState, composeTouched: true };
     await writeState(context, composeState);
     currentState = composeState;
@@ -219,7 +254,8 @@ export async function up(
 
     const startToken = context.randomToken();
     const environment = await loadSanitizedEnvironment(
-      context.dataDirectory,
+      context,
+      currentState,
       startToken,
     );
     await ensureLifecycleDirectory(context);
@@ -271,6 +307,11 @@ export async function status(
       : "LOCAL_CONTROLLED ports occupied",
   );
   if (currentState) {
+    context.write(
+      currentState.ownedTls?.phase === "published"
+        ? "LOCAL_CONTROLLED TLS material published"
+        : "LOCAL_CONTROLLED TLS material incomplete",
+    );
     const keycloakStatus = await readKeycloakUserStatus({
       fetch: context.fetch,
     });
@@ -354,6 +395,7 @@ function createContext(dependencies: LifecycleDependencies) {
     dataDirectoryIdentity: undefined as FileSystemIdentity | undefined,
     lifecycleDirectory: join(dataDirectory, lifecycleDirectoryName),
     lifecycleDirectoryIdentity: undefined as FileSystemIdentity | undefined,
+    tlsDirectory: join(dataDirectory, tlsDirectoryName),
     temporaryFileIdentities: new Map<string, FileSystemIdentity>(),
     publishedDataFiles: new Map<
       (typeof generatedDataFiles)[number],
@@ -363,6 +405,8 @@ function createContext(dependencies: LifecycleDependencies) {
     nodeVersion: dependencies.nodeVersion ?? process.version,
     runner: dependencies.runner ?? systemRunner,
     generateData: dependencies.generateData ?? createLocalControlledData,
+    reserveTls: dependencies.reserveTls ?? reserveLocalTlsBundle,
+    createTls: dependencies.createTls ?? createLocalTlsBundle,
     afterTempFileOpen:
       dependencies.afterTempFileOpen ?? (async () => undefined),
     afterTempFileRename:
@@ -1063,6 +1107,200 @@ async function generateAndPublishData(
   return publishedState;
 }
 
+async function establishTlsMaterial(
+  context: ReturnType<typeof createContext>,
+  state: LocalStackState,
+): Promise<LocalStackState> {
+  await ensureLifecycleDirectory(context);
+  const lifecycleIdentity = context.lifecycleDirectoryIdentity;
+  if (!lifecycleIdentity) {
+    throw new Error("LOCAL_CONTROLLED lifecycle directory identity is unknown");
+  }
+  let currentState: LocalStackState = {
+    ...state,
+    ownedLifecycleDirectory: serializeIdentity(lifecycleIdentity),
+  };
+  await writeState(context, currentState);
+
+  await assertTlsTargetAvailable(context);
+  const reservation = await context.reserveTls({
+    stagingParent: context.lifecycleDirectory,
+  });
+  const stagingName = basename(reservation.directory);
+  if (join(context.lifecycleDirectory, stagingName) !== reservation.directory) {
+    throw new Error(
+      "LOCAL_CONTROLLED TLS reservation is outside the lifecycle directory",
+    );
+  }
+
+  const reserved: OwnedTlsState = {
+    identity: reservation.identity,
+    stagingName,
+    phase: "reserved",
+  };
+  currentState = { ...currentState, ownedTls: reserved };
+  await writeState(context, currentState);
+
+  const bundle = await context.createTls({ reservation });
+  const populated: OwnedTlsState = {
+    ...reserved,
+    fileIdentities: bundle.fileIdentities,
+  };
+  currentState = { ...currentState, ownedTls: populated };
+  await writeState(context, currentState);
+
+  await assertTlsTargetAvailable(context);
+  await context.rename(reservation.directory, context.tlsDirectory);
+  currentState = {
+    ...currentState,
+    ownedTls: { ...populated, phase: "published" },
+  };
+  await writeState(context, currentState);
+  return currentState;
+}
+
+async function assertTlsTargetAvailable(
+  context: ReturnType<typeof createContext>,
+): Promise<void> {
+  await assertDestructivePaths(context);
+  try {
+    await lstat(context.tlsDirectory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error("LOCAL_CONTROLLED refuses to replace existing TLS material");
+}
+
+async function assertPublishedCaCertificate(
+  context: ReturnType<typeof createContext>,
+  state: LocalStackState,
+): Promise<void> {
+  const owned = publishedTlsMaterial(state);
+  await assertDestructivePaths(context);
+  const directoryDetails = await lstat(context.tlsDirectory);
+  if (
+    !directoryDetails.isDirectory() ||
+    directoryDetails.isSymbolicLink() ||
+    !sameSerializedIdentity(serializeIdentity(directoryDetails), owned.identity)
+  ) {
+    throw new Error("LOCAL_CONTROLLED TLS directory changed before Compose");
+  }
+
+  const handle = await open(
+    join(context.tlsDirectory, tlsCaCertificateName),
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const details = await handle.stat();
+    if (
+      !details.isFile() ||
+      !sameSerializedIdentity(
+        serializeIdentity(details),
+        owned.fileIdentities.caCertificate,
+      )
+    ) {
+      throw new Error(
+        "LOCAL_CONTROLLED TLS bind source changed before Compose",
+      );
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function publishedTlsMaterial(state: LocalStackState): OwnedTlsState & {
+  fileIdentities: LocalTlsBundle["fileIdentities"];
+} {
+  const owned = state.ownedTls;
+  if (owned?.phase !== "published" || !owned.fileIdentities) {
+    throw new Error("LOCAL_CONTROLLED TLS material is not published");
+  }
+  return { ...owned, fileIdentities: owned.fileIdentities };
+}
+
+async function removeOwnedTls(
+  context: ReturnType<typeof createContext>,
+  state: LocalStackState,
+): Promise<void> {
+  const owned = state.ownedTls;
+  if (!owned) return;
+  if (
+    !owned.stagingName ||
+    basename(owned.stagingName) !== owned.stagingName ||
+    join(context.lifecycleDirectory, owned.stagingName) ===
+      context.lifecycleDirectory
+  ) {
+    throw new Error("LOCAL_CONTROLLED journalled TLS staging name is invalid");
+  }
+
+  const stagingPath = join(context.lifecycleDirectory, owned.stagingName);
+  const published = await hasJournalledTlsIdentity(
+    context,
+    context.tlsDirectory,
+    owned,
+  );
+  const staged = await hasJournalledTlsIdentity(context, stagingPath, owned);
+  if (published && staged) {
+    throw new Error("LOCAL_CONTROLLED TLS material exists in two locations");
+  }
+  if (published) {
+    await removeOwnedEntry(
+      context,
+      context.tlsDirectory,
+      "directory",
+      "TLS material",
+    );
+    return;
+  }
+  if (staged) {
+    await removeOwnedEntry(
+      context,
+      stagingPath,
+      "directory",
+      "TLS reservation",
+    );
+  }
+}
+
+async function hasJournalledTlsIdentity(
+  context: ReturnType<typeof createContext>,
+  path: string,
+  owned: OwnedTlsState,
+): Promise<boolean> {
+  await assertDestructivePaths(context);
+  let details: Awaited<ReturnType<typeof lstat>>;
+  try {
+    details = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (
+    !details.isDirectory() ||
+    details.isSymbolicLink() ||
+    !sameSerializedIdentity(serializeIdentity(details), owned.identity)
+  ) {
+    throw new Error(
+      "LOCAL_CONTROLLED refuses to delete unexpected TLS material",
+    );
+  }
+  return true;
+}
+
+function serializeIdentity(
+  identity: FileSystemIdentity,
+): SerializedFileIdentity {
+  return { dev: String(identity.dev), ino: String(identity.ino) };
+}
+
+function sameSerializedIdentity(
+  left: SerializedFileIdentity,
+  right: SerializedFileIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
 function assertGeneratedData(generatedData: LocalControlledDataFiles): void {
   const keys = Object.keys(generatedData);
   if (
@@ -1158,7 +1396,7 @@ function isState(value: unknown): value is LocalStackState {
   if (!value || typeof value !== "object") return false;
   const state = value as Partial<LocalStackState>;
   if (
-    state.version !== 1 ||
+    state.version !== 2 ||
     state.composeProject !== LOCAL_CONTROLLED.composeProject ||
     typeof state.twitterWasRunning !== "boolean" ||
     typeof state.twitterStopped !== "boolean" ||
@@ -1172,7 +1410,10 @@ function isState(value: unknown): value is LocalStackState {
         !generatedDataFiles.includes(
           file as (typeof generatedDataFiles)[number],
         ),
-    )
+    ) ||
+    (state.ownedLifecycleDirectory !== undefined &&
+      !isSerializedIdentity(state.ownedLifecycleDirectory)) ||
+    (state.ownedTls !== undefined && !isOwnedTlsState(state.ownedTls))
   ) {
     return false;
   }
@@ -1183,6 +1424,33 @@ function isState(value: unknown): value is LocalStackState {
       state.hostProcess.pid > 0 &&
       typeof state.hostProcess.startToken === "string" &&
       state.hostProcess.startToken.length >= 16)
+  );
+}
+
+function isSerializedIdentity(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const identity = value as Partial<SerializedFileIdentity>;
+  return typeof identity.dev === "string" && typeof identity.ino === "string";
+}
+
+function isOwnedTlsState(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const owned = value as Partial<OwnedTlsState>;
+  if (
+    !isSerializedIdentity(owned.identity) ||
+    typeof owned.stagingName !== "string" ||
+    (owned.phase !== "reserved" && owned.phase !== "published")
+  ) {
+    return false;
+  }
+  if (owned.fileIdentities === undefined) return true;
+  const files = owned.fileIdentities as Partial<
+    LocalTlsBundle["fileIdentities"]
+  >;
+  return (
+    isSerializedIdentity(files.caCertificate) &&
+    isSerializedIdentity(files.serverCertificate) &&
+    isSerializedIdentity(files.serverPrivateKey)
   );
 }
 
@@ -1376,6 +1644,7 @@ async function removeOwnedData(
     );
     context.publishedDataFiles.delete(file);
   }
+  await removeOwnedTls(context, state);
   await removeTemporaryFiles(context);
   await removeOwnedEntry(
     context,
@@ -1562,12 +1831,14 @@ async function deleteQuarantinedEntry(
 }
 
 async function loadSanitizedEnvironment(
-  dataDirectory: string,
+  context: ReturnType<typeof createContext>,
+  state: LocalStackState,
   startToken: string,
 ): Promise<NodeJS.ProcessEnv> {
+  const owned = publishedTlsMaterial(state);
   const [baseEnvironment, controlledEnvironment] = await Promise.all([
-    readFile(join(dataDirectory, ".env"), "utf8"),
-    readFile(join(dataDirectory, "local-controlled.env"), "utf8"),
+    readFile(join(context.dataDirectory, ".env"), "utf8"),
+    readFile(join(context.dataDirectory, "local-controlled.env"), "utf8"),
   ]);
   const parsed = {
     ...parseEnvironment(baseEnvironment),
@@ -1578,6 +1849,7 @@ async function loadSanitizedEnvironment(
     "NODE_ENV",
     "NODE_OPTIONS",
     "LOCAL_STACK_START_TOKEN",
+    ...hostTlsEnvironmentNames,
   ]) {
     if (parsed[forbidden] !== undefined) {
       throw new Error(
@@ -1590,6 +1862,20 @@ async function loadSanitizedEnvironment(
     PATH: process.env.PATH,
     NODE_ENV: "production",
     LOCAL_STACK_START_TOKEN: startToken,
+    LOCAL_TLS_CERTIFICATE_PATH: join(
+      context.tlsDirectory,
+      tlsServerCertificateName,
+    ),
+    LOCAL_TLS_PRIVATE_KEY_PATH: join(
+      context.tlsDirectory,
+      tlsServerPrivateKeyName,
+    ),
+    LOCAL_TLS_CERTIFICATE_IDENTITY: JSON.stringify(
+      owned.fileIdentities.serverCertificate,
+    ),
+    LOCAL_TLS_PRIVATE_KEY_IDENTITY: JSON.stringify(
+      owned.fileIdentities.serverPrivateKey,
+    ),
   };
 }
 

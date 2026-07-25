@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { LOCAL_CONTROLLED } from "../scripts/local-controlled-config.js";
 import { generateLocalControlledData } from "../scripts/setup-local-controlled.js";
 
 const VS_SOURCE = "/tmp/reviewed-vs-agent";
@@ -27,8 +28,10 @@ describe("generateLocalControlledData", () => {
 
       expect(env.EVIDENCE_MODE).toBe("LOCAL_CONTROLLED");
       expect(env.VS_AGENT_SOURCE_PATH).toBe(VS_SOURCE);
-      expect(env.EXPECTED_ISSUER_DID).toBe("did:web:issuer.localhost");
-      expect(env.EXPECTED_VERIFIER_DID).toBe("did:web:verifier.localhost");
+      expect(env.EXPECTED_ISSUER_DID).toBe("did:web:issuer.localhost%3A3443");
+      expect(env.EXPECTED_VERIFIER_DID).toBe(
+        "did:web:verifier.localhost%3A3443",
+      );
       expect(
         new Set([
           env.ISSUER_WALLET_KEY,
@@ -78,6 +81,57 @@ describe("generateLocalControlledData", () => {
       expect(localEnv.VS_AGENT_ISSUER_BASE_URL).toBe("http://localhost:3101");
       expect(localEnv.VS_AGENT_HOLDER_BASE_URL).toBe("http://localhost:3111");
       expect(localEnv.VS_AGENT_VERIFIER_BASE_URL).toBe("http://localhost:3201");
+    } finally {
+      await rm(output, { recursive: true, force: true });
+    }
+  });
+
+  it("pins the DID-bound controlled trust contract for the agents", async () => {
+    const output = await mkdtemp(join(tmpdir(), "verana-keycloak-controlled-"));
+    try {
+      await generateLocalControlledData(output, VS_SOURCE);
+      const env = parseEnv(
+        await readFile(join(output, "local-controlled.env"), "utf8"),
+      );
+
+      expect(env.EXPECTED_HOLDER_DID).toBe("did:web:holder.localhost%3A3443");
+      expect(env.ROGUE_VERIFIER_DID).toBe(
+        "did:web:verifier.localhost%3A3443:rogue",
+      );
+      expect(env.VERANA_RESOLVER_URL).toBe("https://resolver.localhost:3443");
+      expect(env.UNFOLD_VCT).toBe(
+        "https://resolver.localhost:3443/vct/local-controlled-employee",
+      );
+      expect(env.UNFOLD_VTJSC_ID).toBe(
+        "https://resolver.localhost:3443/vtjsc/local-controlled-employee.json",
+      );
+      expect(env.VS_AGENT_IMAGE).toBe(
+        "verana-keycloak-local-controlled-vs-agent:747f8f1",
+      );
+    } finally {
+      await rm(output, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps host orchestration on loopback HTTP while expecting controlled identities", async () => {
+    const output = await mkdtemp(join(tmpdir(), "verana-keycloak-controlled-"));
+    try {
+      await generateLocalControlledData(output, VS_SOURCE);
+      const env = parseEnv(await readFile(join(output, ".env"), "utf8"));
+
+      expect(env.EXPECTED_ISSUER_DID).toBe(LOCAL_CONTROLLED.issuerDid);
+      expect(env.EXPECTED_VERIFIER_DID).toBe(LOCAL_CONTROLLED.verifierDid);
+      expect(env.EXPECTED_VCT).toBe(LOCAL_CONTROLLED.vct);
+      expect(env.EXPECTED_VTJSC_ID).toBe(LOCAL_CONTROLLED.vtjscId);
+      for (const name of [
+        "VS_AGENT_ISSUER_BASE_URL",
+        "VS_AGENT_HOLDER_BASE_URL",
+        "VS_AGENT_VERIFIER_BASE_URL",
+        "DEMO_APP_BASE_URL",
+        "BROKER_ISSUER",
+      ]) {
+        expect(env[name]).toMatch(/^http:\/\/localhost:\d+$/);
+      }
     } finally {
       await rm(output, { recursive: true, force: true });
     }

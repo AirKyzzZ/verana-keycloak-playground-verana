@@ -38,7 +38,7 @@ function controlledEnvironment(vsAgentSourcePath: string): string[] {
   return [
     `EVIDENCE_MODE=${LOCAL_CONTROLLED.evidenceMode}`,
     `VS_AGENT_SOURCE_PATH=${vsAgentSourcePath}`,
-    "VS_AGENT_IMAGE=verana-keycloak-local-controlled-vs-agent:e2bba78",
+    `VS_AGENT_IMAGE=verana-keycloak-local-controlled-vs-agent:${LOCAL_CONTROLLED.requiredVsCommit}`,
     `EXPECTED_ISSUER_DID=${LOCAL_CONTROLLED.issuerDid}`,
     `EXPECTED_HOLDER_DID=${LOCAL_CONTROLLED.holderDid}`,
     `EXPECTED_VERIFIER_DID=${LOCAL_CONTROLLED.verifierDid}`,
