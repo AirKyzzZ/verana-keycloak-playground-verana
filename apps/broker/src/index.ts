@@ -26,6 +26,9 @@ export async function createBrokerApplication(
     accountStore,
     expectedVct: config.EXPECTED_VCT,
     expectedVtjscId: config.EXPECTED_VTJSC_ID,
+    expectedNetwork: config.EXPECTED_NETWORK,
+    expectedEcosystemId: config.EXPECTED_ECOSYSTEM_ID,
+    expectedCredentialSchemaId: config.EXPECTED_CREDENTIAL_SCHEMA_ID,
     sectorIdentifier: config.SECTOR_IDENTIFIER,
     pairwiseSubSecret: new TextEncoder().encode(config.PAIRWISE_SUB_SECRET),
   });

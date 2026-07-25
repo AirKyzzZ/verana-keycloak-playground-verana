@@ -56,9 +56,9 @@ const receiptSchema = z.strictObject({
       }),
     }),
     registry: z.strictObject({
-      network: z.literal("vna-testnet-1"),
-      trustRegistry: z.literal(184),
-      schema: z.literal(249),
+      network: z.string().min(1),
+      trustRegistry: z.number().int().nonnegative(),
+      schema: z.number().int().nonnegative(),
       vtjscId: z.string().min(1),
     }),
   }),
@@ -87,6 +87,16 @@ export function authorizeReceipt(
 
   if (verifiedReceipt.registry.vtjscId !== expected.vtjscId) {
     throw new Error("schema_mismatch");
+  }
+
+  // The registry tuple is configured, not assumed: a receipt from a different
+  // network, ecosystem, or credential schema must never open a session.
+  if (
+    verifiedReceipt.registry.network !== expected.network ||
+    verifiedReceipt.registry.trustRegistry !== expected.ecosystemId ||
+    verifiedReceipt.registry.schema !== expected.credentialSchemaId
+  ) {
+    throw new Error("registry_mismatch");
   }
 
   if (verifiedReceipt.exchange.tenant !== "trusted") {

@@ -283,6 +283,31 @@ export function createDemoServer(options: DemoServerOptions): Koa {
       const reviewedOffer = await walletClient.reviewOffer(
         issued.credentialOffer,
       );
+      // A refused issuer is a valid, terminal trust outcome, not a transport
+      // failure: render its Proof of Trust instead of a generic error.
+      if (reviewedOffer.verdict !== "TRUSTED_AUTHORIZED") {
+        replaceCurrentOperation(
+          walletStore,
+          access.token,
+          "issuing",
+          operationId,
+          {
+            csrfToken: access.workflow.csrfToken,
+            refusedOffer: reviewedOffer,
+            workflowStatus: "issue_refused",
+          },
+        );
+        html(
+          context,
+          200,
+          renderWalletPage(config.EVIDENCE_MODE, {
+            csrfToken: access.workflow.csrfToken,
+            refusedOffer: reviewedOffer,
+            workflowStatus: "issue_refused",
+          }),
+        );
+        return;
+      }
       const acceptedBadge = await walletClient.acceptOffer(reviewedOffer);
       if (controlled && acceptedBadge.subjectId !== CONTROLLED_SUBJECT) {
         throw new Error("controlled_subject_mismatch");

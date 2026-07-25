@@ -19,6 +19,9 @@ export interface ExpectedReceipt {
   sessionId: string;
   vct: string;
   vtjscId: string;
+  network: string;
+  ecosystemId: number;
+  credentialSchemaId: number;
 }
 
 export interface LoginTransaction {

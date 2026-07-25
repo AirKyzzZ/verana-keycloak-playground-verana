@@ -3,18 +3,27 @@ import type { KeycloakIdentity } from "./keycloak-client.js";
 import type {
   AcceptedBadge,
   ResolvedPresentation,
+  ReviewedOffer,
   SharedPresentation,
 } from "./local-wallet-client.js";
+import {
+  type HolderTrustState,
+  offerProofOfTrust,
+  type ProofOfTrustView,
+  presentationProofOfTrust,
+} from "./trust-view.js";
 
 export interface WalletPageState {
   acceptedBadge?: AcceptedBadge;
   csrfToken: string;
+  refusedOffer?: ReviewedOffer;
   resolution?: ResolvedPresentation;
   shared?: SharedPresentation;
   workflowStatus:
     | "idle"
     | "issuing"
     | "issue_failed"
+    | "issue_refused"
     | "resolving"
     | "resolve_failed"
     | "resolved"
@@ -116,6 +125,9 @@ export function renderWalletPage(
         state.workflowStatus === "resolved",
       )
     : "";
+  const refusedOffer = state.refusedOffer
+    ? renderOfferReview(state.refusedOffer)
+    : "";
   const shared = state.shared?.shared
     ? `<p class="success">Presentation shared through the local holder.</p>`
     : "";
@@ -171,6 +183,7 @@ export function renderWalletPage(
       </form>
       ${rogueDenialControl}
       ${workflowNotice}
+      ${refusedOffer}
       ${resolution}
       ${shared}
       <p><a href="/">Return to protected application</a></p>
@@ -216,16 +229,41 @@ export function renderErrorPage(
   );
 }
 
+const TRUST_STATE_CLASS: Record<HolderTrustState, string> = {
+  RESOLVING: "warning",
+  TRUSTED: "success",
+  UNTRUSTED: "error",
+  UNVERIFIED: "warning",
+};
+
+export function renderProofOfTrust(view: ProofOfTrustView): string {
+  const blocks = view.blocks
+    .map((block) => {
+      const rows = block.rows
+        .map(
+          (row) =>
+            `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`,
+        )
+        .join("");
+      return `<section class="trust-block"><h3>${escapeHtml(block.title)}</h3><dl>${rows}</dl></section>`;
+    })
+    .join("");
+
+  return `
+    <div class="proof-of-trust" data-trust-state="${escapeHtml(view.state)}">
+      <p class="${TRUST_STATE_CLASS[view.state]}">${escapeHtml(view.state)} — ${escapeHtml(view.headline)}</p>
+      ${blocks}
+    </div>
+  `;
+}
+
 function renderResolution(
   resolution: ResolvedPresentation,
   csrfField: string,
   canShare: boolean,
 ): string {
-  const positive = resolution.verdict === "TRUSTED_AUTHORIZED";
-  const requestedClaims = resolution.request.requestedClaims
-    .map((claim) => `<li><code>${escapeHtml(claim)}</code></li>`)
-    .join("");
-  const verdictClass = positive ? "success" : "error";
+  const view = presentationProofOfTrust(resolution);
+  const positive = view.state === "TRUSTED";
   const action = !positive
     ? `<p class="error">Sharing refused. The verifier is not both trusted and authorized.</p>`
     : canShare
@@ -240,20 +278,18 @@ function renderResolution(
   return `
     <section class="result">
       <h2>Verifier review</h2>
-      <p class="${verdictClass}">Verdict: ${escapeHtml(resolution.verdict)}</p>
-      <dl>
-        <dt>Verifier DID</dt>
-        <dd>${escapeHtml(resolution.request.verifierDid ?? "Unavailable")}</dd>
-        <dt>Trust status</dt>
-        <dd>${escapeHtml(resolution.evidence.trustStatus ?? "Unavailable")}</dd>
-        <dt>Authorized for schema</dt>
-        <dd>${escapeHtml(String(resolution.evidence.authorized))}</dd>
-        <dt>Requested credential type</dt>
-        <dd>${escapeHtml(resolution.request.requestedVct ?? "Unavailable")}</dd>
-      </dl>
-      <h3>Requested claims</h3>
-      <ul>${requestedClaims}</ul>
+      ${renderProofOfTrust(view)}
       ${action}
+    </section>
+  `;
+}
+
+export function renderOfferReview(review: ReviewedOffer): string {
+  return `
+    <section class="result">
+      <h2>Issuer review</h2>
+      ${renderProofOfTrust(offerProofOfTrust(review))}
+      <p class="error">Issuance refused. The issuer is not both trusted and authorized, so no credential was requested or stored.</p>
     </section>
   `;
 }
@@ -266,6 +302,8 @@ function renderWorkflowNotice(
       return `<p class="warning">Badge issuance is in progress.</p>`;
     case "issue_failed":
       return `<p class="error">Badge issuance failed. Any previous sharing approval has been discarded.</p>`;
+    case "issue_refused":
+      return `<p class="error">Badge issuance was refused by the trust check. No credential was requested or stored.</p>`;
     case "resolving":
       return `<p class="warning">A new request is being resolved. Any previous sharing approval has been discarded.</p>`;
     case "resolve_failed":

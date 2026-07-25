@@ -29,6 +29,13 @@ export const brokerConfigSchema = z.object({
   VS_AGENT_VERIFIER_BASE_URL: z.string().url().default("http://localhost:3201"),
   EXPECTED_VCT: z.string().url(),
   EXPECTED_VTJSC_ID: z.string().min(1),
+  EXPECTED_NETWORK: z.string().min(1).default("local-controlled"),
+  EXPECTED_ECOSYSTEM_ID: z.coerce.number().int().nonnegative().default(184),
+  EXPECTED_CREDENTIAL_SCHEMA_ID: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .default(249),
   SECTOR_IDENTIFIER: z.string().default("verana-playground"),
   PAIRWISE_SUB_SECRET: z.string().min(32),
   BROKER_JWKS_PATH: z.string().default(".data/broker-jwks.json"),

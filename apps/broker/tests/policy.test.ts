@@ -11,6 +11,9 @@ const expected = {
   sessionId: "vs-1",
   vct: EXPECTED_VCT,
   vtjscId: EXPECTED_VTJSC_ID,
+  network: "vna-testnet-1",
+  ecosystemId: 184,
+  credentialSchemaId: 249,
 };
 
 function authorizationError(receipt: unknown): string {
@@ -139,7 +142,7 @@ describe("authorizeReceipt", () => {
     const receipt = structuredClone(positiveSession);
     Object.assign(receipt.receipt.registry, { [field]: value });
 
-    expect(authorizationError(receipt)).toBe("invalid_receipt");
+    expect(authorizationError(receipt)).toBe("registry_mismatch");
   });
 
   it("rejects unknown nested fields without exposing parser or body details", () => {

@@ -22,6 +22,9 @@ export interface LoginServiceOptions {
   accountStore: LoginAccountStore;
   expectedVct: string;
   expectedVtjscId: string;
+  expectedNetwork: string;
+  expectedEcosystemId: number;
+  expectedCredentialSchemaId: number;
   sectorIdentifier: string;
   pairwiseSubSecret: Uint8Array;
 }
@@ -33,6 +36,7 @@ const denialCodes = new Set([
   "session_mismatch",
   "vct_mismatch",
   "schema_mismatch",
+  "registry_mismatch",
   "tenant_not_allowed",
   "verifier_not_authorized",
   "issuer_not_authorized",
@@ -44,6 +48,9 @@ export class LoginService {
   readonly #accountStore: LoginAccountStore;
   readonly #expectedVct: string;
   readonly #expectedVtjscId: string;
+  readonly #expectedNetwork: string;
+  readonly #expectedEcosystemId: number;
+  readonly #expectedCredentialSchemaId: number;
   readonly #pairwiseSubSecret: Uint8Array;
   readonly #sectorIdentifier: string;
   readonly #states = new Map<string, LoginState>();
@@ -54,6 +61,9 @@ export class LoginService {
     this.#accountStore = options.accountStore;
     this.#expectedVct = options.expectedVct;
     this.#expectedVtjscId = options.expectedVtjscId;
+    this.#expectedNetwork = options.expectedNetwork;
+    this.#expectedEcosystemId = options.expectedEcosystemId;
+    this.#expectedCredentialSchemaId = options.expectedCredentialSchemaId;
     this.#pairwiseSubSecret = options.pairwiseSubSecret;
     this.#sectorIdentifier = options.sectorIdentifier;
     this.#transactionStore = options.transactionStore;
@@ -96,6 +106,9 @@ export class LoginService {
         sessionId: transaction.vsSessionId,
         vct: this.#expectedVct,
         vtjscId: this.#expectedVtjscId,
+        network: this.#expectedNetwork,
+        ecosystemId: this.#expectedEcosystemId,
+        credentialSchemaId: this.#expectedCredentialSchemaId,
       });
     } catch (error) {
       const errorCode =

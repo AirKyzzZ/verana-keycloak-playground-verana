@@ -116,6 +116,7 @@ export interface LocalFlowConfig {
   expectedVtjscId: string;
   expectedEcosystemId: number;
   expectedCredentialSchemaId: number;
+  expectedNetwork: string;
   holderBaseUrl: string;
   issuerBaseUrl: string;
   keycloakIssuer: string;
@@ -354,6 +355,7 @@ export function loadLocalFlowConfig(
     pairwiseSubSecret: new TextEncoder().encode(
       requireSecret(localSecrets, "PAIRWISE_SUB_SECRET"),
     ),
+    expectedNetwork: environment.VERANA_NETWORK_ID ?? LOCAL_CONTROLLED.networkId,
     expectedEcosystemId: registryId(
       environment.VERANA_ECOSYSTEM_ID,
       LOCAL_CONTROLLED.ecosystemId,
@@ -597,6 +599,9 @@ async function runTrustedPresentation(
       sessionId: request.sessionId,
       vct: config.expectedVct,
       vtjscId: config.expectedVtjscId,
+      network: config.expectedNetwork,
+      ecosystemId: config.expectedEcosystemId,
+      credentialSchemaId: config.expectedCredentialSchemaId,
     });
     if (
       identity.issuerDid !== config.expectedIssuerDid ||
