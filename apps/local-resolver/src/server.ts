@@ -3,6 +3,15 @@ import Router, { type RouterContext } from "@koa/router";
 import Koa from "koa";
 
 import { LOCAL_CONTROLLED_CONTRACT, resolveResponse } from "./contract.js";
+import {
+  ecosystemDidDocument,
+  linkedVerifiablePresentation,
+} from "./ecosystem.js";
+
+const PRESENTATION_HOLDERS = Object.freeze({
+  "2": LOCAL_CONTROLLED_CONTRACT.issuerDid,
+  "3": LOCAL_CONTROLLED_CONTRACT.verifierDid,
+} as Record<string, string>);
 
 const LOCAL_VCT = Object.freeze({
   vct: LOCAL_CONTROLLED_CONTRACT.vct,
@@ -141,6 +150,25 @@ export function createLocalResolver(options: LocalResolverOptions = {}): Koa {
     }
 
     ctx.body = resolveResponse(parsed, now());
+  });
+
+  router.get("/ecosystem/did.json", (ctx) => {
+    ctx.type = "application/did+ld+json";
+    ctx.body = ecosystemDidDocument();
+  });
+
+  router.get("/presentations/:participantId-vtjsc-vp.jwt", (ctx) => {
+    const holderDid = PRESENTATION_HOLDERS[ctx.params.participantId ?? ""];
+    if (!holderDid) {
+      ctx.status = 404;
+      ctx.body = { error: "not_found" };
+      return;
+    }
+    ctx.type = "application/jwt";
+    ctx.body = linkedVerifiablePresentation(
+      holderDid,
+      Math.floor(now() / 1000),
+    );
   });
 
   router.get("/vct/local-controlled-employee", (ctx) => {

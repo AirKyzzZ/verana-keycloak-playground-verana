@@ -120,7 +120,7 @@ function presentations(did: string): unknown[] {
   const participantId = participantIdFor(did);
   return [
     {
-      id: `${GATEWAY_ORIGIN}/presentations/${participantId}-vtjsc-vp.jsonld`,
+      id: `${GATEWAY_ORIGIN}/presentations/${participantId}-vtjsc-vp.jwt`,
       serviceId: `${did}${LINKED_VP_SERVICE_FRAGMENT}`,
       vtcCredentials: [
         {
@@ -143,7 +143,7 @@ function services(did: string): unknown[] {
     {
       id: `${did}${LINKED_VP_SERVICE_FRAGMENT}`,
       type: "LinkedVerifiablePresentation",
-      serviceEndpoint: `${GATEWAY_ORIGIN}/presentations/${participantId}-vtjsc-vp.jsonld`,
+      serviceEndpoint: `${GATEWAY_ORIGIN}/presentations/${participantId}-vtjsc-vp.jwt`,
     },
   ];
 }

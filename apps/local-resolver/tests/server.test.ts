@@ -1,12 +1,15 @@
 import request from "supertest";
 import { describe, expect, it } from "vitest";
-
 import {
   CREDENTIAL_SCHEMA_ID,
   ECOSYSTEM_ID,
   LINKED_VP_SERVICE_FRAGMENT,
   LOCAL_CONTROLLED_CONTRACT,
 } from "../src/contract.js";
+import {
+  ECOSYSTEM_VERIFICATION_METHOD,
+  verifyLinkedVerifiablePresentation,
+} from "../src/ecosystem.js";
 import { createLocalResolver } from "../src/server.js";
 
 const ISSUER = LOCAL_CONTROLLED_CONTRACT.issuerDid;
@@ -338,5 +341,97 @@ describe("controlled local resolver faults", () => {
     expect(overwrite.status).toBe(409);
     expect(reset.status).toBe(200);
     expect(reset.body).toEqual({ armed: false });
+  });
+});
+
+describe("ecosystem DID document and Linked VP", () => {
+  it("serves a DID document whose id and verification method share one base DID", async () => {
+    const response = await resolver().get("/ecosystem/did.json");
+
+    expect(response.status).toBe(200);
+    expect(response.type).toBe("application/did+ld+json");
+    expect(response.body.id).toBe(LOCAL_CONTROLLED_CONTRACT.ecosystemDid);
+
+    const method = response.body.verificationMethod[0];
+    expect(method.id).toBe(ECOSYSTEM_VERIFICATION_METHOD);
+    expect(
+      method.id.startsWith(`${LOCAL_CONTROLLED_CONTRACT.ecosystemDid}#`),
+    ).toBe(true);
+    expect(method.controller).toBe(LOCAL_CONTROLLED_CONTRACT.ecosystemDid);
+    expect(method.publicKeyJwk.crv).toBe("Ed25519");
+    expect(response.body.assertionMethod).toContain(
+      ECOSYSTEM_VERIFICATION_METHOD,
+    );
+  });
+
+  it("keeps the published verification method stable across restarts", async () => {
+    const [first, second] = await Promise.all([
+      resolver().get("/ecosystem/did.json"),
+      resolver().get("/ecosystem/did.json"),
+    ]);
+
+    expect(first.body.verificationMethod[0].publicKeyJwk).toEqual(
+      second.body.verificationMethod[0].publicKeyJwk,
+    );
+  });
+
+  it.each([
+    ["2", LOCAL_CONTROLLED_CONTRACT.issuerDid],
+    ["3", LOCAL_CONTROLLED_CONTRACT.verifierDid],
+  ])(
+    "serves a Linked VP for participant %s that verifies against the published key",
+    async (participantId, holderDid) => {
+      const response = await resolver().get(
+        `/presentations/${participantId}-vtjsc-vp.jwt`,
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.type).toBe("application/jwt");
+
+      const token = response.text;
+      expect(verifyLinkedVerifiablePresentation(token)).toBe(true);
+
+      const payloadPart = token.split(".")[1] ?? "";
+      const payload = JSON.parse(
+        Buffer.from(payloadPart, "base64url").toString("utf8"),
+      );
+      expect(payload.iss).toBe(LOCAL_CONTROLLED_CONTRACT.ecosystemDid);
+      expect(payload.sub).toBe(holderDid);
+      expect(payload.vp.holder).toBe(holderDid);
+      expect(
+        payload.vp.verifiableCredential[0].credentialSubject.serviceId,
+      ).toBe(`${holderDid}${LINKED_VP_SERVICE_FRAGMENT}`);
+    },
+  );
+
+  it("rejects a tampered Linked VP", async () => {
+    const response = await resolver().get("/presentations/2-vtjsc-vp.jwt");
+    const [header, payload, signature] = response.text.split(".");
+    const forged = JSON.parse(
+      Buffer.from(payload ?? "", "base64url").toString("utf8"),
+    );
+    forged.sub = LOCAL_CONTROLLED_CONTRACT.rogueDid;
+    const tampered = `${header}.${Buffer.from(JSON.stringify(forged)).toString(
+      "base64url",
+    )}.${signature}`;
+
+    expect(verifyLinkedVerifiablePresentation(tampered)).toBe(false);
+  });
+
+  it("returns 404 for an unknown participant presentation", async () => {
+    const response = await resolver().get("/presentations/99-vtjsc-vp.jwt");
+
+    expect(response.status).toBe(404);
+  });
+
+  it("advertises the served presentation URL as the service endpoint", async () => {
+    const [trust, presentation] = await Promise.all([
+      resolver().post(RESOLVE_PATH).send(q1Body(ISSUER)),
+      resolver().get("/presentations/2-vtjsc-vp.jwt"),
+    ]);
+
+    const endpoint = trust.body.services[0].serviceEndpoint as string;
+    expect(endpoint).toContain("/presentations/2-vtjsc-vp.jwt");
+    expect(presentation.status).toBe(200);
   });
 });

@@ -14,7 +14,7 @@
     "local:adversarial": "tsx scripts/verify-local-adversaries.ts",
     "dev": "pnpm --parallel --filter @verana-playground/broker --filter @verana-playground/demo-app dev",
     "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm -r typecheck && tsc -p tsconfig.scripts.json",
     "lint": "biome check .",
     "test": "vitest run",
     "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
