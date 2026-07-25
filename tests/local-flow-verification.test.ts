@@ -336,8 +336,8 @@ describe("local flow verification", () => {
     expect(services.brokerCalls()).toBe(0);
     expect(services.keycloakUnexpectedRequests()).toBe(0);
     expect(services.walletAcceptBodies()).toEqual([
-      { credentialOffer: "offer-1" },
-      { credentialOffer: "offer-2" },
+      { gateId: "issue-gate-1" },
+      { gateId: "issue-gate-2" },
     ]);
   });
 
@@ -744,7 +744,7 @@ function controlledFlowConfig(): LocalFlowConfig {
     pairwiseSubSecret: new TextEncoder().encode(
       "test-secret-at-least-32-bytes-long",
     ),
-    resolverUrl: LOCAL_CONTROLLED.resolverUrl,
+    resolverUrl: LOCAL_CONTROLLED.hostResolverUrl,
     sectorIdentifier: "verana-playground",
     verifierBaseUrl: "http://localhost:3201",
   };
@@ -866,7 +866,7 @@ async function startFakeServices(
         trusted,
         evaluatedAtTime: "2026-07-25T17:38:31Z",
         evaluatedAtBlock: 4_488_868,
-        expiresAtTime: null,
+        expiresAtTime: trusted ? "2027-07-25T17:38:31Z" : null,
         corporationId: 1,
         ecsCredentials: [],
         presentations: [],
@@ -1009,7 +1009,8 @@ async function startFakeServices(
         body.subjectId !== expectedSubject ||
         body.organization !== "ACME" ||
         body.role !== "employee" ||
-        Object.keys(body).length !== 3
+        body.credentialConfigurationId !== "verana-trusted-attestation" ||
+        Object.keys(body).length !== 4
       ) {
         json(response, 400, {});
         return;
@@ -1018,6 +1019,30 @@ async function startFakeServices(
         credentialOffer: `offer-${issueCount}`,
         credentialOfferObject: {},
         issuanceSessionId: `issuance-${issueCount}`,
+      });
+      return;
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/holder/oid4vc-demo/wallet/review-offer"
+    ) {
+      await readJson(request);
+      const controlled = controlledRequest(request);
+      const issuerDid = controlled ? LOCAL_CONTROLLED.issuerDid : ISSUER_DID;
+      json(response, 200, {
+        gateId: `issue-gate-${issueCount}`,
+        verdict: "TRUSTED_AUTHORIZED",
+        issuerDid,
+        credentialIssuer: controlled
+          ? "https://issuer.localhost:3443/oid4vci/unfold"
+          : "https://issuer.example/oid4vci/unfold",
+        evidence: {
+          did: issuerDid,
+          trustStatus: "TRUSTED",
+          authorized: true,
+          vtjscId: controlled ? LOCAL_CONTROLLED.vtjscId : VTJSC,
+          queries: [],
+        },
       });
       return;
     }
@@ -1134,14 +1159,10 @@ async function startFakeServices(
             : (behavior.resolutionRequestedVct ?? vct),
           requestedClaims: rogue
             ? (behavior.rogueRequestedClaims ?? [
-                "subject_id",
-                "organization",
-                "role",
+                ...LOCAL_CONTROLLED.requestedClaims,
               ])
             : (behavior.resolutionRequestedClaims ?? [
-                "subject_id",
-                "organization",
-                "role",
+                ...LOCAL_CONTROLLED.requestedClaims,
               ]),
         },
       });
@@ -1486,7 +1507,7 @@ function mapControlledUrl(
     ["localhost:3111", "/holder"],
     ["localhost:3201", "/verifier"],
     ["localhost:8080", "/keycloak"],
-    ["resolver.localhost:3443", "/trust"],
+    ["localhost:3099", "/trust"],
   ]);
   const prefix = routes.get(url.host);
   if (!prefix) return { controlled: false, url };
