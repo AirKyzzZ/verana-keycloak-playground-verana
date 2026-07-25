@@ -768,6 +768,8 @@ git commit -m "test: verify controlled authentication end to end"
 ### Task 6: Run the real stack, deep-test Chrome, record bounded evidence, and restore local state
 
 **Files:**
+- Modify: controlled resolver, lifecycle, Keycloak verification, and demo-wallet sources and tests
+- Create: a sanitized Keycloak status command and a controlled live-adversary command
 - Modify: `README.md`
 - Create: `docs/evidence/local-controlled-run.md`
 
@@ -775,6 +777,43 @@ git commit -m "test: verify controlled authentication end to end"
 - Consumes: all commands and components from Tasks 1 through 5.
 - Produces: a sanitized evidence record separating automated, local-controlled API, real Chrome, teardown, and unproven external claims.
 - Leaves both Git worktrees clean and does not push.
+
+- [ ] **Step 0A: Close runtime-readiness gaps before stack startup**
+
+For `LOCAL_CONTROLLED` only:
+
+- make `local-controlled-user` the fixed holder subject and reject a browser
+  override;
+- add a browser-reachable rogue-verifier denial that takes no caller-selected
+  tenant or authorization-request body, never crosses the Keycloak broker, and
+  never exposes a share action;
+- add a read-only Keycloak status command that accepts only expected user
+  count and optional expected hashed account/subject references, reads no more
+  than one account, and prints no raw ID, username, subject, token, credential,
+  presentation, receipt, cookie, or secret;
+- add authenticated, loopback-only, one-shot controlled-resolver fault modes
+  for unavailable, malformed JSON, and oversized body, with bounded expiry,
+  no overwrite, reset in `finally`, and no production/LIVE_VERANA route;
+- add a live adversary command that proves each resolver failure stays bounded
+  and leaves the sanitized Keycloak account reference unchanged.
+
+Keep oversized or malformed broker-to-verifier responses, invalid UTF-8,
+non-JSON responses, replay, uncertain share, timeout, stale-gate, returned-DID
+drift, `production:false`, and Q2/Q3 DID/VTJSC mismatch as automated adversarial
+evidence. A live verifier proxy or verifier fault hook would enlarge the attack
+surface and would not be real-component evidence.
+
+The local resolver remains a controlled adapter for the PR #13-style Q1
+contract. Because current normative v4 uses a different resolver interface and
+the final ECS-Badge/testnet authorizations are unresolved, no local result may
+be labeled PR-v4 acceptance, testnet Q2/Q3 proof, or production readiness.
+
+- [ ] **Step 0B: Review the two runtime-readiness slices**
+
+Implement the resolver/lifecycle/status slice and the browser-denial slice in
+non-overlapping file ownership. Require strict red-green evidence, focused and
+full gates, and independent review with no Critical or Important finding before
+running `local:up`.
 
 - [ ] **Step 1: Verify both worktrees and current commits before runtime mutation**
 
@@ -815,7 +854,7 @@ pnpm local:status
 
 Expected: startup prints `LOCAL_CONTROLLED`, all loopback URLs, capability contracts for issuer/holder/verifier, and zero Keycloak users without printing secrets.
 
-- [ ] **Step 4: Run the live API and adversarial matrix**
+- [ ] **Step 4: Run the live API baseline**
 
 Run:
 
@@ -825,7 +864,7 @@ pnpm local:verify
 
 Expected: the terminal line is exactly `PASS LOCAL_CONTROLLED`.
 
-Then exercise, one at a time, rogue verifier, resolver unavailable during a fresh login, malformed resolver JSON, oversized resolver body, and oversized broker-to-verifier body using test-only resolver fault controls that bind to the existing loopback process and reset after each case. After each case, run the sanitized user-count command and confirm it remains `1`.
+At this point the sanitized Keycloak user count remains `0`.
 
 - [ ] **Step 5: Deep-test the real Chrome flow**
 
@@ -843,6 +882,19 @@ Using Maxime's existing Chrome profile:
 10. Inspect console and relevant network requests for unexpected errors, third-party destinations, raw secrets, credentials, presentations, tokens, or receipts.
 
 Capture only screenshots that show the proof label, non-sensitive profile mapping, denial state, and sanitized user count. Store them temporarily under `.data/evidence/`; do not commit the image files.
+
+- [ ] **Step 5A: Run the live controlled-resolver adversarial matrix**
+
+After the repeated Chrome login has established and reused one account, run
+the controlled resolver-unavailable, malformed-JSON, and oversized-body cases.
+Each case must be one-shot, reset after use, leave the account count at `1`,
+and preserve the same hashed account and subject references. The Chrome rogue
+denial and the API rogue corroboration must also preserve those references.
+
+Do not claim direct Keycloak session-count evidence unless a read-only bounded
+session query is implemented and observed. The browser network trace, absence
+of a Keycloak/broker transition for the rogue path, and unchanged account
+reference prove only that the denial created no account.
 
 - [ ] **Step 6: Write the operator runbook and sanitized evidence**
 
