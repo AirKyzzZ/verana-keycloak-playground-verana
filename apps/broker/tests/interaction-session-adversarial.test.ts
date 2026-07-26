@@ -269,11 +269,7 @@ describe("authorized wallet logins establish exactly one broker session", () => 
     });
   });
 
-  // Known broker defect: `loginOnlyPolicy` drops the consent prompt but no
-  // `provider.Grant` is ever created, so oidc-provider resolves the resumed
-  // authorization with `access_denied` ("no scope was granted"). Flip this to
-  // `it(...)` once the Grant is wired.
-  it.fails("issues an authorization code for a fully authorized login", async () => {
+  it("issues an authorization code for a fully authorized login", async () => {
     const { agent } = createHarness();
     const { path } = await beginLogin(agent);
     const complete = await agent.get(`${path}/complete`);
@@ -287,19 +283,6 @@ describe("authorized wallet logins establish exactly one broker session", () => 
       config.KEYCLOAK_BROKER_REDIRECT_URI,
     );
     expect(resumed.headers.location).toContain("code=");
-  });
-
-  it("denies the resumed authorization instead of issuing a code", async () => {
-    const { agent } = createHarness();
-    const { path } = await beginLogin(agent);
-    const complete = await agent.get(`${path}/complete`);
-
-    const resumed = await agent.get(
-      new URL(complete.headers.location, config.BROKER_ISSUER).pathname,
-    );
-
-    expect(resumed.headers.location).toContain("error=access_denied");
-    expect(resumed.headers.location).not.toContain("code=");
   });
 
   it("keeps the interaction cookie http-only and scoped to its own interaction", async () => {

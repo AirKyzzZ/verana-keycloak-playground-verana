@@ -240,7 +240,7 @@ describe("Keycloak verification helpers", () => {
     expect(keycloak.requests().slice(0, 3)).toEqual([
       "POST /realms/master/protocol/openid-connect/token",
       "GET /admin/realms/verana-playground/users/count",
-      "GET /admin/realms/verana-playground/users?first=0&max=1&briefRepresentation=true",
+      "GET /admin/realms/verana-playground/users?first=0&max=1&briefRepresentation=false",
     ]);
     expect(keycloak.requests().slice(3).sort()).toEqual([
       "GET /admin/realms/verana-playground/users/user-1/groups",

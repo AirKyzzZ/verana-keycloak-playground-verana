@@ -60,6 +60,27 @@ export function createOidcProvider({
     },
     findAccount: async (_context, accountId) =>
       accountStore.findAccount(accountId),
+    // consent prompt is removed, so the openid grant must be created here or
+    // every login resolves access_denied ("no scope was granted")
+    loadExistingGrant: async (context) => {
+      const client = context.oidc.client;
+      const session = context.oidc.session;
+      if (client?.clientId !== config.BROKER_CLIENT_ID || !session?.accountId) {
+        return undefined;
+      }
+      const grantId = session.grantIdFor(client.clientId);
+      if (grantId) {
+        const existing = await context.oidc.provider.Grant.find(grantId);
+        if (existing) return existing;
+      }
+      const grant = new context.oidc.provider.Grant({
+        clientId: client.clientId,
+        accountId: session.accountId,
+      });
+      grant.addOIDCScope("openid");
+      await grant.save();
+      return grant;
+    },
     ttl: {
       AuthorizationCode: 60,
       Interaction: 300,

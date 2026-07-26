@@ -186,7 +186,7 @@ export async function readKeycloakUserStatus(
 
   const users = parseUsers(
     await requestKeycloakJson(
-      `${realmUsersUrl}?first=0&max=1&briefRepresentation=true`,
+      `${realmUsersUrl}?first=0&max=1&briefRepresentation=false`,
       { headers: { authorization: `Bearer ${accessToken}` } },
       fetchImpl,
     ),
