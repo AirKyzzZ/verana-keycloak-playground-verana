@@ -64,10 +64,24 @@ const receiptSchema = z.strictObject({
   }),
 });
 
+// zod strictObject rejects unknown keys, but a literal "__proto__" own key
+// (as produced by JSON.parse) is silently tolerated; reject it here so such a
+// receipt is denied like any other unknown key rather than slipping through.
+function carriesProtoKey(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(carriesProtoKey);
+  if (value !== null && typeof value === "object") {
+    if (Object.hasOwn(value, "__proto__")) return true;
+    return Object.values(value).some(carriesProtoKey);
+  }
+  return false;
+}
+
 export function authorizeReceipt(
   receipt: unknown,
   expected: ExpectedReceipt,
 ): AuthorizedIdentity {
+  if (carriesProtoKey(receipt)) throw new Error("invalid_receipt");
+
   const parsed = receiptSchema.safeParse(receipt);
 
   if (!parsed.success) throw new Error("invalid_receipt");

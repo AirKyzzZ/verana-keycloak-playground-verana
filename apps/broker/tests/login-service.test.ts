@@ -154,6 +154,25 @@ describe("LoginService", () => {
     expect(accounts.saved.size).toBe(0);
   });
 
+  it("denies a receipt carrying a __proto__ own key without creating an account", async () => {
+    const polluted = structuredClone(positiveSession);
+    Object.defineProperty(polluted.receipt.verifier.evidence, "__proto__", {
+      value: { polluted: true },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    const { accounts, service } = createService(async () => polluted);
+    await service.start("tx-1");
+
+    await expect(service.poll("tx-1")).resolves.toMatchObject({
+      uid: "tx-1",
+      status: "denied",
+      errorCode: "invalid_receipt",
+    });
+    expect(accounts.saved.size).toBe(0);
+  });
+
   it("marks an unavailable verifier session without creating an account", async () => {
     const { accounts, service } = createService(async () => {
       throw new Error("vs_agent_unavailable");
