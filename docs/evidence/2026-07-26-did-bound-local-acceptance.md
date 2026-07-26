@@ -108,9 +108,11 @@ have shown a green check.
 - **Playground `pnpm check` (lint + typecheck + test + build): GREEN.**
   608 passed + 5 `it.fails` documented-defect markers across 31 test files.
 - **VS Agent plugin package:** 242/242 tests, compile/format/types/build clean.
-- **VS Agent host app:** 50/54 — the 4 failures are the pre-existing
-  `trustService.test.ts` JSON-LD context-dereferencing failures, reproduced at
-  the pristine branch baseline and unrelated to OpenID4VC (tracked separately).
+- **VS Agent host app:** **54/54** — the 4 previously-failing `trustService.test.ts`
+  JSON-LD tests are now FIXED (commit `fa8af2b`). Root cause was the VC 2.0
+  `https://www.w3.org/ns/credentials/examples/v2` context missing from the document
+  loader's static cache (its v1 sibling was present); vendored it following the
+  loader's existing pattern for ~19 other contexts. No verification weakened.
 
 The typecheck gate was extended to cover `scripts/` (`tsc -p tsconfig.scripts.json`),
 which immediately caught a `KeyObject` type error the vitest run had sailed past.
@@ -184,18 +186,20 @@ Participant ids per ECS type. Remaining known deltas, deferred:
   account → protected profile) is interactive across three origins under a strict
   no-JS CSP; it is set up and reachable but not captured as a single automated
   browser sequence. Next-session item.
-- The 4 `trustService.test.ts` JSON-LD failures on the VS Agent host app.
 - The `__proto__`-through-`strictObject` and broker-tests-excluded-from-tsconfig
   findings raised by the audit pass (both low impact, spawned as follow-ups).
+
+*(Resolved during this session: the 4 `trustService.test.ts` JSON-LD failures — see §4.)*
 
 ---
 
 ## 8. Next-session pickup
 
 1. Capture the full browser Keycloak completion (or script it) to move §7 item 1
-   from PROVEN_UNIT to PROVEN_LIVE.
-2. FIDES issuer catalog research + integration plan (Phase G/H) — see the
-   companion issuer-catalog doc.
-3. Reconcile the §6 spec deltas once PRs #22/#23 land.
-4. Fold the JSON-LD `trustService` fix (tracked) so the VS Agent host suite is
-   fully green.
+   from PROVEN_UNIT to PROVEN_LIVE. Blocked overnight only by a pathological VS
+   Agent image rebuild on a disk-pressured Colima; prune Docker / free the machine,
+   then a clean `pnpm local:up` should get there.
+2. Start the first issuer integration — the FIDES Labs issuer (already `did:web`)
+   is the fastest live target; see `research/fides-issuer-catalog-2026-07-26.md` in
+   the hub for the recipe and the parallel Animo/Credo Mode-A play (Phase G/H).
+3. Reconcile the §6 spec deltas once `verana-spec` PRs #22/#23 land.
