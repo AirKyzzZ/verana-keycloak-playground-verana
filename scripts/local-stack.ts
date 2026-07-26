@@ -816,13 +816,6 @@ async function waitForAgentServices(fetchImpl: typeof fetch): Promise<void> {
   ]);
 }
 
-async function waitForContainerServices(
-  fetchImpl: typeof fetch,
-): Promise<void> {
-  await waitForKeycloak(fetchImpl);
-  await waitForAgentServices(fetchImpl);
-}
-
 // The gateway terminates TLS with a per-run private CA, so readiness is a TCP
 // accept rather than an HTTP probe: a fetch would fail certificate validation
 // before proving anything about the listener.

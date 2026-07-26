@@ -357,7 +357,8 @@ export function loadLocalFlowConfig(
     pairwiseSubSecret: new TextEncoder().encode(
       requireSecret(localSecrets, "PAIRWISE_SUB_SECRET"),
     ),
-    expectedNetwork: environment.VERANA_NETWORK_ID ?? LOCAL_CONTROLLED.networkId,
+    expectedNetwork:
+      environment.VERANA_NETWORK_ID ?? LOCAL_CONTROLLED.networkId,
     expectedEcosystemId: registryId(
       environment.VERANA_ECOSYSTEM_ID,
       LOCAL_CONTROLLED.ecosystemId,
