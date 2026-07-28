@@ -87,3 +87,19 @@ the curl run created (deterministic pairwise subject), rather than minting a sec
 `pnpm check` green: lint, typecheck, **31/31 test files, 609 passed + 4 expected-fail (613)**,
 build. Fresh-stack `pnpm local:verify` and `pnpm local:adversarial` re-run green today after
 the changes (see session log).
+
+## Re-proof on resurrected stack (2026-07-29, human-driven)
+
+After the 2026-07-28 crash recovery (fresh colima, regenerated TLS/env), the full browser flow
+was driven by hand for the first time (no scripts, no driven browser): issue at /wallet, copy
+request from the QR page, resolve TRUSTED_AUTHORIZED, share, broker poller resumed Keycloak,
+protected profile reached. State assertion: KEYCLOAK USERS 1, PASS GROUP ACME, PASS ROLE
+employee, PASS SUBJECT mapped. Automated local:verify + local:adversarial had re-run green on
+the same stack earlier the same evening (users 0 precondition, before the manual run).
+
+Operational notes from the retry path: the resolve step fails as a generic "Local VS Agent
+unavailable" card when the 120 s verifier gate has expired (the bounded client collapses the
+404), and a second GET /login overwrites the single auth transaction, so a straggler tab
+completing yields "Invalid login callback". Neither is a defect of the trust path; both are
+fail-closed refusals with unhelpful labels. Polish candidates: distinct expiry copy, and
+local:verify/local:users self-loading their env (bare runs default to LIVE_VERANA / count 0).
